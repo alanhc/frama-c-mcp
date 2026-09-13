@@ -20,11 +20,13 @@ fn percent(numerator: usize, denominator: usize) -> f64 {
 
 /// What a receipt's recorded file hashes say about the tree as it is now.
 ///
-/// Nothing else reads "/subject/files" back, so a conclusion stored before an
-/// edit stayed "verified" through any number of rewrites of the body it was
-/// about. stale_dependencies only tracks a callee's contract text and
+/// This is what notices a source edit. proof_receipt_evidence_error also reads
+/// "/subject/files" now, but only to refuse a receipt whose files the server
+/// could not hash at all; it says nothing about whether those files have since
+/// changed. stale_dependencies only tracks a callee's contract text and
 /// stale_proof_environment only moves when some other receipt is stored, so
-/// neither of them sees a function's own source change.
+/// without the comparison below a conclusion stays "verified" through any
+/// number of rewrites of the body it was about.
 ///
 /// A file the receipt named but that cannot be read now is counted rather than
 /// judged. A sandbox receipt outlives the directory it proved, so a missing

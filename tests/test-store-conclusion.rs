@@ -47,6 +47,17 @@ fn proof_receipt(function: &str) -> serde_json::Value {
     )
 }
 
+/// Re-stamp a receipt whose body a test has edited.
+///
+/// The outer digest covers every other field, so any edit invalidates it and
+/// the receipt is refused for the wrong reason: a test meaning to exercise one
+/// branch lands on the self-hash branch above it and passes without ever
+/// reaching what it was written for.
+fn rehash_receipt(mut receipt: serde_json::Value) -> serde_json::Value {
+    receipt.as_object_mut().unwrap().remove("sha256");
+    frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(receipt)
+}
+
 /// A conclusion whose receipt this build did not write loads as unverified,
 /// keeps everything else, and says so.
 ///
@@ -198,6 +209,25 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
     let current = loaded.get("current").expect("current conclusion loads");
     assert_eq!(current.status, VerificationStatus::Verified);
     assert!(current.proof_receipt.is_some());
+}
+
+/// A source file the server could not hash is not evidence.
+///
+/// The receipt is real and its own digest is correct, which is what makes this
+/// worth a test: the run happened, WP proved what it proved, and the only thing
+/// missing is any way to say which bytes it proved it about. Nothing else in
+/// the chain refuses it, so a conclusion would have stored naming files the
+/// server never read.
+#[test]
+fn a_receipt_fails_closed_when_its_source_evidence_is_incoherent() {
+    let mut unreadable = proof_receipt("unreadable");
+    unreadable["subject"]["files"][0]["sha256"] = serde_json::Value::Null;
+    unreadable["subject"]["files"][0]["error"] = serde_json::json!("permission denied");
+    let unreadable = rehash_receipt(unreadable);
+    assert_eq!(
+        proof_receipt_evidence_error(&unreadable, 1, "unreadable").as_deref(),
+        Some("proof_receipt has unreadable or malformed source files")
+    );
 }
 
 #[test]

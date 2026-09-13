@@ -75,6 +75,32 @@ pub fn proof_receipt_evidence_error(
              recomputed {recomputed}); pass back the receipt this server returned, unchanged"
         ));
     }
+    let Some(files) = receipt.pointer("/subject/files").and_then(|v| v.as_array()) else {
+        return Some("proof_receipt does not carry a source file list".to_string());
+    };
+    // Readability only. Whether subject.source_hash agrees with these entries
+    // is not asked, because the whole-receipt digest above already covers both
+    // of them: a receipt whose outer hash matches is byte-identical to what the
+    // writer emitted, and the writer derives source_hash from this very array.
+    // Only a forgery carrying a correct outer digest and a wrong inner one
+    // could fail such a check, and this function's own preamble puts a
+    // consistently assembled forgery out of scope.
+    //
+    // Unreadable is a different case and stays: it produces a genuine,
+    // correctly hashed receipt with a null digest, so it is reachable in
+    // ordinary use. The sha256 clause is what catches it:
+    // proof_receipt_source_files writes a null digest and an error string
+    // together, so testing the error key as well restated the same condition
+    // and coupled this check to a second field for nothing. A forged receipt
+    // dodges an error key by omitting it and cannot dodge a missing digest.
+    if files.is_empty()
+        || files.iter().any(|file| {
+            file.get("path").and_then(|v| v.as_str()).is_none_or(str::is_empty)
+                || file.get("sha256").and_then(|v| v.as_str()).is_none_or(str::is_empty)
+        })
+    {
+        return Some("proof_receipt has unreadable or malformed source files".to_string());
+    }
     let Some(goals) = receipt.get("goals").and_then(|v| v.as_array()) else {
         return Some("missing proof_receipt goals".to_string());
     };
