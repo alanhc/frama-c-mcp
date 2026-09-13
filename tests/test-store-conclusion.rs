@@ -154,10 +154,34 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
         proof_receipt_evidence_error(&hollow, 1, "hollow").as_deref(),
         Some("proof_receipt has no goals")
     );
+    let discharge_error = Some(
+        "proof_receipt goals are not all discharged; a goal is unproved, or proved only \
+         under hypotheses that cannot hold",
+    );
     assert_eq!(
         proof_receipt_evidence_error(&wrong_status, 1, "wrong_status").as_deref(),
-        Some("proof_receipt goals are not all valid")
+        discharge_error
     );
+
+    // The same door, closed against the other way a goal reaches "valid"
+    // without being proved. A contract weakened to "requires \false" discharges
+    // every obligation vacuously, so the status scan this replaced waved it
+    // through and the conclusion stored, reloaded and listed as verified.
+    let vacuous = receipt_fixture::fixture_receipt(
+        "receipt-sha",
+        &["vacuous"],
+        serde_json::json!({"frama_c_version": "31.0"}),
+        vec![serde_json::json!({
+            "stable_goal_id": "g0",
+            "status": "valid",
+            "vacuously_proved": true,
+        })],
+    );
+    assert_eq!(
+        proof_receipt_evidence_error(&vacuous, 1, "vacuous").as_deref(),
+        discharge_error
+    );
+
 
     // The count branch has no fixture on disk, because a conclusion whose
     // wp_summary disagrees with its own receipt is a different defect from the

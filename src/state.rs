@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mcp::server::receipt::RECEIPT_SCHEMA;
+use crate::mcp::server::receipt::{receipt_goal_is_progress, RECEIPT_SCHEMA};
 
 /// Why a receipt is not evidence this build can stand behind, or None.
 ///
@@ -84,11 +84,24 @@ pub fn proof_receipt_evidence_error(
     if goals.len() as u32 != goal_total {
         return Some("proof_receipt goal count does not match wp_summary".to_string());
     }
-    if goals
-        .iter()
-        .any(|goal| goal.get("status").and_then(|v| v.as_str()) != Some("valid"))
-    {
-        return Some("proof_receipt goals are not all valid".to_string());
+    // Not a status scan. A goal discharged only because its hypotheses cannot
+    // hold is stamped valid like any other, so a contract weakened to
+    // "requires \false" produced an all-valid receipt, a wp_summary whose
+    // valid equals its total, and a conclusion that stored and reloaded as
+    // Verified. get_wp_goals refuses to call that progress; refusing it here
+    // too is what stops the durable artifact from being the laxer of the pair,
+    // which is the wrong way round: a diff is read once, a conclusion persists
+    // to disk and is believed again next session.
+    //
+    // Receipts written before the field carry no vacuously_proved key and read
+    // as false, so this tightens on new evidence and leaves old evidence
+    // standing rather than demoting a shelf of conclusions on upgrade.
+    if goals.iter().any(|goal| !receipt_goal_is_progress(goal)) {
+        return Some(
+            "proof_receipt goals are not all discharged; a goal is unproved, or proved only \
+             under hypotheses that cannot hold"
+                .to_string(),
+        );
     }
 
     // A sandbox proves an extracted copy of the function whose uncontracted

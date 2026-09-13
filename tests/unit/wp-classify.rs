@@ -3,6 +3,7 @@ use serde_json::json;
 use crate::server_fixture::lazy_server;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
+use frama_c_mcp::mcp::server::property_status_map;
 use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
@@ -1014,6 +1015,44 @@ fn a_receipt_goal_records_the_function_it_belongs_to() {
     // the shape the fallback exists for.
     let older = vec![json!({"stable_goal_id": "sg_a", "status": "valid"})];
     assert!(!receipt_goals_record_owner(&older));
+}
+
+// A valid goal is not always a discharged obligation, and the receipt is the
+// last place that difference can be written down. Its goal rows keep the status
+// and a handful of ids; the property consolidation that says why a goal is
+// valid lives on the enriched goal and is gone by the time anything reads the
+// receipt back. Without this field a diff counting statuses scores a contract
+// weakened to "requires \false" as a completed proof, which is the cheapest
+// edit available to anything optimizing that number.
+#[test]
+fn a_receipt_goal_separates_a_vacuous_proof_from_a_real_one() {
+    let properties = property_status_map(&[
+        json!({"key": "p_real", "status": "valid"}),
+        json!({"key": "p_false_hyp", "status": "valid_under_false_hypothesis"}),
+        json!({"key": "p_dead", "status": "valid_but_dead"}),
+    ]);
+    let goals = proof_receipt_goals(
+        &[
+            json!({"stable_goal_id": "sg_real", "normalized_status": "valid", "property": "p_real"}),
+            json!({"stable_goal_id": "sg_hyp", "normalized_status": "valid", "property": "p_false_hyp"}),
+            json!({"stable_goal_id": "sg_dead", "normalized_status": "valid", "property": "p_dead"}),
+        ],
+        None,
+        &properties,
+    );
+    let vacuous_of = |id: &str| {
+        goals
+            .iter()
+            .find(|goal| goal["stable_goal_id"] == id)
+            .unwrap_or_else(|| panic!("{id} is in the receipt"))["vacuously_proved"]
+            .clone()
+    };
+    assert_eq!(vacuous_of("sg_real"), json!(false));
+    assert_eq!(vacuous_of("sg_hyp"), json!(true));
+
+    // Unreachable is a separate finding, reported as PROPERTY_DEAD, so folding
+    // it in here would file dead code as a weakened specification.
+    assert_eq!(vacuous_of("sg_dead"), json!(false));
 }
 
 #[test]

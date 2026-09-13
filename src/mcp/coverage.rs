@@ -538,7 +538,15 @@ pub fn proof_coverage_report(
                     .unwrap_or("unknown"),
             );
             *by_status.entry(status.clone()).or_default() += 1;
-            if status == "valid" {
+            // Not "status == valid". A goal proved only because its hypotheses
+            // cannot hold is stamped valid like any other, so counting the
+            // status scored a contract weakened to "requires \false" as covered
+            // and could report verdict "complete" on it. The conclusion door
+            // and the goal diff both refuse to call that a discharged
+            // obligation; this is the third reader of the same receipt field
+            // and it has no business being the lax one. by_status above stays a
+            // status histogram, because that is what it says it is.
+            if receipt_goal_is_progress(goal) {
                 // Through the accessor, which falls back to the summary where
                 // the lifted field is absent. Reading the key alone called such
                 // a goal freshly proved, which is the flattering direction for

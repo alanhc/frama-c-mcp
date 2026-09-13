@@ -944,22 +944,40 @@ pub fn append_to_error_message(error: &mut McpError, sentence: &str) {
 /// `bsearch.c`'s 29 goals are valid and carried one anyway, 97 KB of a 226 KB
 /// response.
 ///
-/// One exception keeps the flag useful. A call precondition with status `valid`
-/// and property status `valid_under_false_hypothesis` was discharged only
-/// because the hypothesis cannot hold, which is a finding
-/// (`callee_requires_too_strict`) and not a proof.
-///
-/// Dead code is not that exception, even though it also sets `vacuous`. A
-/// `_but_dead` property means unreachable, `check` already reports it as
-/// `PROPERTY_DEAD`, and the classification WP-shaped advice would give it
-/// ("WP did not prove this obligation") is simply false.
+/// One exception keeps the flag useful, and goal_is_vacuously_proved is that
+/// exception: a goal discharged only because its hypotheses cannot hold is a
+/// finding rather than a proof.
 pub fn goal_needs_failure_classification(goal: &serde_json::Value) -> bool {
-    let proved = own_status_is_proved(goal);
-    let vacuous = goal
-        .get("vacuous")
+    !own_status_is_proved(goal) || goal_is_vacuously_proved(goal)
+}
+
+/// Proved, but only because the hypotheses cannot hold.
+///
+/// One spelling, because three callers ask this and each of them gets a
+/// different thing wrong without it: the failure classifier above attaches fix
+/// advice on it, proof_receipt_goals records it per goal so a receipt read back
+/// later can still tell, and the conclusion door refuses to call such a receipt
+/// evidence. Written out at each, the carve-out below becomes three paragraphs
+/// of prose agreeing by habit, and the disagreement that produces is silent:
+/// one path reports a finding on a goal another path is scoring as progress.
+///
+/// A call precondition with status valid and property status
+/// valid_under_false_hypothesis is the shape this catches. It is a finding,
+/// callee_requires_too_strict, and not a proof.
+///
+/// Dead code is not that shape, even though it also sets the vacuous flag. A
+/// "_but_dead" property means unreachable, check already reports it as
+/// PROPERTY_DEAD, and the WP-shaped advice the classifier would attach ("WP did
+/// not prove this obligation") is simply false.
+///
+/// Reads the enriched goal, so enrich_goal_with_property_status has to have
+/// run: that is what writes both fields. A receipt row is a narrower shape and
+/// asks through receipt_goal_is_progress instead.
+pub fn goal_is_vacuously_proved(goal: &serde_json::Value) -> bool {
+    goal.get("vacuous")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    !proved || (vacuous && !property_is_dead(goal))
+        .unwrap_or(false)
+        && !property_is_dead(goal)
 }
 
 /// Whether a backend abort left a goal in this run without a verdict.
