@@ -944,22 +944,214 @@ pub fn append_to_error_message(error: &mut McpError, sentence: &str) {
 /// `bsearch.c`'s 29 goals are valid and carried one anyway, 97 KB of a 226 KB
 /// response.
 ///
-/// One exception keeps the flag useful. A call precondition with status `valid`
-/// and property status `valid_under_false_hypothesis` was discharged only
-/// because the hypothesis cannot hold, which is a finding
-/// (`callee_requires_too_strict`) and not a proof.
-///
-/// Dead code is not that exception, even though it also sets `vacuous`. A
-/// `_but_dead` property means unreachable, `check` already reports it as
-/// `PROPERTY_DEAD`, and the classification WP-shaped advice would give it
-/// ("WP did not prove this obligation") is simply false.
+/// One exception keeps the flag useful, and goal_is_vacuously_proved is that
+/// exception: a goal discharged only because its hypotheses cannot hold is a
+/// finding rather than a proof.
 pub fn goal_needs_failure_classification(goal: &serde_json::Value) -> bool {
-    let proved = own_status_is_proved(goal);
-    let vacuous = goal
-        .get("vacuous")
+    !own_status_is_proved(goal) || goal_is_vacuously_proved(goal)
+}
+
+/// Proved, but only because the hypotheses cannot hold.
+///
+/// One spelling, because three callers ask this and each of them gets a
+/// different thing wrong without it: the failure classifier above attaches fix
+/// advice on it, proof_receipt_goals records it per goal so a receipt read back
+/// later can still tell, and the conclusion door refuses to call such a receipt
+/// evidence. Written out at each, the carve-out below becomes three paragraphs
+/// of prose agreeing by habit, and the disagreement that produces is silent:
+/// one path reports a finding on a goal another path is scoring as progress.
+///
+/// A call precondition with status valid and property status
+/// valid_under_false_hypothesis is the shape this catches. It is a finding,
+/// callee_requires_too_strict, and not a proof.
+///
+/// Dead code is not that shape, even though it also sets the vacuous flag. A
+/// "_but_dead" property means unreachable, check already reports it as
+/// PROPERTY_DEAD, and the WP-shaped advice the classifier would attach ("WP did
+/// not prove this obligation") is simply false.
+///
+/// Reads the enriched goal, so enrich_goal_with_property_status has to have
+/// run: that is what writes both fields. A receipt row is a narrower shape and
+/// asks through receipt_goal_is_progress instead.
+pub fn goal_is_vacuously_proved(goal: &serde_json::Value) -> bool {
+    goal.get("vacuous")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    !proved || (vacuous && !property_is_dead(goal))
+        .unwrap_or(false)
+        && !property_is_dead(goal)
+}
+
+/// One wording for "this server never handed out that receipt", because two
+/// places answer it: the pre-check that runs before any Frama-C work, and the
+/// lookup in wp_goal_diff after the lock was dropped and retaken.
+pub(crate) fn unknown_since_error(since: &str) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "no run with proof_receipt.sha256 {since:?} in this session; \
+             `since` names a receipt this server handed out, and they are not kept across restarts"
+        ),
+        None,
+    )
+}
+
+/// What changed since a run the caller names by its receipt hash.
+///
+/// Keyed on stable_goal_id, which is what makes this a join rather than a
+/// guess: measured across an injected requires, both runs carry the same ids
+/// and exactly one status differs.
+///
+/// An id present now and absent then is "appeared", and the reverse is
+/// "disappeared", because a goal that stopped existing is not a goal that got
+/// proved. Merging the two into "newly_proved" would report an annotation
+/// someone deleted as progress.
+///
+/// Transitions are classified on the discharged boundary rather than on the
+/// status text, so a goal that stayed valid and started resting on hypotheses
+/// nothing establishes is reported as lost rather than as unchanged. A move
+/// between two undischarged statuses is neither progress nor regression:
+/// unknown becoming timeout is a prover getting slower, not a proof being lost.
+///
+/// Compares occurrence by occurrence, so a receipt that repeats a stable id
+/// keeps both rows instead of one silently shadowing the other.
+pub fn proof_goal_diff(
+    since: &str,
+    previous: &[serde_json::Value],
+    current: &[serde_json::Value],
+) -> serde_json::Value {
+    fn status_of(goal: &serde_json::Value) -> &str {
+        goal.get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+    }
+
+    let progress = |goals: &[serde_json::Value]| {
+        let proved = goals
+            .iter()
+            .filter(|goal| receipt_goal_is_progress(goal))
+            .count();
+        json!({
+            "proved": proved,
+            "total": goals.len(),
+            "fraction": if goals.is_empty() { 0.0 } else { proved as f64 / goals.len() as f64 },
+        })
+    };
+
+    // A stable id normally names one goal, but malformed or legacy receipts
+    // can repeat one. Keep every occurrence and prefer a match with the same
+    // progress state, then the same status, so reordering duplicates cannot
+    // manufacture a transition.
+    //
+    // The candidate scan is linear in the size of one id's group, which is one
+    // element for every id a well-formed receipt carries. Bucket by status if a
+    // receipt ever repeats an id enough times for that to matter.
+    let mut before: BTreeMap<&str, Vec<&serde_json::Value>> = BTreeMap::new();
+    for goal in previous {
+        if let Some(id) = goal.get("stable_goal_id").and_then(|value| value.as_str()) {
+            before.entry(id).or_default().push(goal);
+        }
+    }
+
+    let mut newly_proved = Vec::new();
+    let mut newly_unproved = Vec::new();
+    let mut status_changed = Vec::new();
+    let mut appeared = Vec::new();
+    let mut unchanged_count = 0usize;
+    let mut shared_total = 0usize;
+    let mut shared_proved_now = 0usize;
+    let mut shared_proved_before = 0usize;
+
+    for goal in current {
+        let Some(id) = goal.get("stable_goal_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let now = status_of(goal);
+        let now_proved = receipt_goal_is_progress(goal);
+        let earlier = before.get_mut(id).and_then(|candidates| {
+            let position = candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, candidate)| {
+                    (
+                        receipt_goal_is_progress(candidate) != now_proved,
+                        status_of(candidate) != now,
+                    )
+                })
+                .map(|(position, _)| position)?;
+            Some(candidates.remove(position))
+        });
+        let was = earlier.map(status_of);
+
+        // The status alone cannot explain every transition this reports. A goal
+        // that stayed "valid" and started resting on hypotheses that cannot
+        // hold moves from proved to not proved, so it lands in newly_unproved
+        // carrying "valid" on both sides, which reads as a contradiction. These
+        // two say which side of the boundary each run put it on.
+        let row = json!({
+            "stable_goal_id": id,
+            "status": now,
+            "was": was,
+            "discharged": now_proved,
+            "was_discharged": earlier.map(receipt_goal_is_progress),
+        });
+        let Some(earlier) = earlier else {
+            appeared.push(row);
+            continue;
+        };
+
+        let was_proved = receipt_goal_is_progress(earlier);
+        shared_total += 1;
+        shared_proved_now += usize::from(now_proved);
+        shared_proved_before += usize::from(was_proved);
+
+        if now_proved != was_proved {
+            if now_proved {
+                newly_proved.push(row);
+            } else {
+                newly_unproved.push(row);
+            }
+        } else if was == Some(now) {
+            unchanged_count += 1;
+        } else {
+            status_changed.push(row);
+        }
+    }
+
+    let disappeared: Vec<serde_json::Value> = before
+        .into_iter()
+        .flat_map(|(id, goals)| {
+            goals
+                .into_iter()
+                .map(move |goal| {
+                    json!({
+                        "stable_goal_id": id,
+                        "was": status_of(goal),
+                        "was_discharged": receipt_goal_is_progress(goal),
+                    })
+                })
+        })
+        .collect();
+    let comparable = shared_total == previous.len() && shared_total == current.len();
+    let fraction_delta = if shared_total == 0 {
+        0.0
+    } else {
+        (shared_proved_now as f64 - shared_proved_before as f64) / shared_total as f64
+    };
+
+    json!({
+        "since": since,
+        "progress": {
+            "comparable": comparable,
+            "fraction_delta": fraction_delta,
+            "shared_total": shared_total,
+            "before": progress(previous),
+            "current": progress(current),
+        },
+        "newly_proved": newly_proved,
+        "newly_unproved": newly_unproved,
+        "status_changed": status_changed,
+        "appeared": appeared,
+        "disappeared": disappeared,
+        "unchanged_count": unchanged_count,
+    })
 }
 
 /// Whether a backend abort left a goal in this run without a verdict.
@@ -4435,6 +4627,32 @@ impl FramaCMcpServer {
         status: Option<&str>,
         since: Option<&str>,
     ) -> Result<serde_json::Value, McpError> {
+        // Paired here rather than checked as two separate conditions, so the
+        // diff below can take a plain scope: a "since" that reached it always
+        // has one. The scope kept is the caller's own spelling, sandbox prefix
+        // and all, because run_wp records that same spelling under
+        // wp_config.functions and the two are compared as written. Handing the
+        // diff stable_scope instead compared a bare "foo" against the
+        // "exp:foo" the receipt holds, which rejected every sandbox diff.
+        let diff_since = match (since, function, status) {
+            (Some(_), _, Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "status cannot be combined with since; a diff already reports every status transition",
+                    None,
+                ))
+            }
+            (Some(_), None, _) => {
+                return Err(McpError::invalid_params(
+                    "function is required with since so both runs have the same scope",
+                    None,
+                ))
+            }
+            (Some(since), Some(function), None) => {
+                self.refuse_unusable_since(since, function).await?;
+                Some(since)
+            }
+            (None, _, _) => None,
+        };
         let client: Arc<FramaCClient>;
         let scope_marker: Option<String>;
         let stable_scope: Option<String>;
@@ -4527,7 +4745,7 @@ impl FramaCMcpServer {
             .cloned()
             .collect();
 
-        if let Some(since) = since {
+        if let Some(since) = diff_since {
             // `stable_goal_id` is a digest over the goal's fields, so it only
             // agrees within one code path: list mode enriches a goal with
             // property status and dependencies before computing the id and the
@@ -4537,7 +4755,16 @@ impl FramaCMcpServer {
             // disappeared and reappeared.
             let current =
                 proof_receipt_goals(&selected, stable_scope.as_deref(), &properties_by_marker);
-            return self.wp_goal_diff(since, &current).await;
+            // Retaken rather than held across the fetches above, which are
+            // Frama-C round trips: a read guard spanning those blocks every
+            // writer for the length of a WP run. refuse_unusable_since already
+            // answered both refusals this receipt can earn, so the lookup here
+            // is the same one it made, not a second kind of it.
+            let state = self.state.read().await;
+            let previous = state
+                .receipt_goals(since)
+                .ok_or_else(|| unknown_since_error(since))?;
+            return Ok(proof_goal_diff(since, previous, &current));
         }
 
         // Add `goal_kind` and (if any) `hash_label` to each goal, so callers
@@ -4604,95 +4831,36 @@ impl FramaCMcpServer {
         Ok(json!(augmented))
     }
 
-    /// What changed since a run the caller names by its receipt hash.
+    /// The refusals a "since" can earn before any Frama-C work is done.
     ///
-    /// Keyed on `stable_goal_id`, which is what makes this a join rather than
-    /// a guess: measured across an injected `requires`, both runs carry the
-    /// same ids and exactly one status differs.
+    /// Both are answered by session state alone, so asking here rather than
+    /// inside wp_goal_diff is the difference between telling a caller their
+    /// receipt is unusable and telling them after a property fetch, a goal
+    /// fetch and a clone of every goal, all of which the diff then discards.
     ///
-    /// An id present now and absent then is `appeared`, and the reverse is
-    /// `disappeared`, because a goal that stopped existing is not a goal that
-    /// got proved. Merging the two into `newly_proved` would report an
-    /// annotation someone deleted as progress.
-    async fn wp_goal_diff(
-        &self,
-        since: &str,
-        current: &[serde_json::Value],
-    ) -> Result<serde_json::Value, McpError> {
-        // Both sides are `proof_receipt_goals` output, which has already
-        // collapsed whichever status field a goal carried into `status`.
-        fn status_of(goal: &serde_json::Value) -> &str {
-            goal.get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown")
-        }
-
+    /// The scope compared is the caller's own spelling, sandbox prefix and all,
+    /// because run_wp records that same spelling under wp_config.functions.
+    /// Comparing the resolved bare name instead matched "foo" against the
+    /// "exp:foo" a sandbox receipt holds and rejected every sandbox diff.
+    async fn refuse_unusable_since(&self, since: &str, function: &str) -> Result<(), McpError> {
         let state = self.state.read().await;
-        let previous = state.receipt_goals(since).ok_or_else(|| {
-            McpError::invalid_params(
+        let Some(receipt) = state.receipt_body(since) else {
+            return Err(unknown_since_error(since));
+        };
+        let functions = receipt
+            .pointer("/wp/functions")
+            .and_then(|value| value.as_array());
+        if functions
+            .is_none_or(|functions| functions.len() != 1 || functions[0].as_str() != Some(function))
+        {
+            return Err(McpError::invalid_params(
                 format!(
-                    "no run with proof_receipt.sha256 {since:?} in this session; \
-                     `since` names a receipt this server handed out, and they are not kept across restarts"
+                    "since receipt was not scoped to function {function:?}; compare runs with the same scope"
                 ),
                 None,
-            )
-        })?;
-
-        // Ordered, because `disappeared` is built by iterating this and a
-        // payload whose array order changes between identical runs is one
-        // nobody can diff or pin in a test.
-        let before: BTreeMap<&str, &str> = previous
-            .iter()
-            .filter_map(|goal| Some((goal.get("stable_goal_id")?.as_str()?, status_of(goal))))
-            .collect();
-
-        let mut newly_proved = Vec::new();
-        let mut newly_unproved = Vec::new();
-        let mut status_changed = Vec::new();
-        let mut appeared = Vec::new();
-        let mut unchanged_count = 0usize;
-        let mut seen: HashSet<&str> = HashSet::new();
-        for goal in current {
-            let Some(id) = goal.get("stable_goal_id").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            seen.insert(id);
-            let now = status_of(goal);
-            let row = json!({"stable_goal_id": id, "status": now, "was": before.get(id)});
-            let Some(was) = before.get(id).copied() else {
-                appeared.push(row);
-                continue;
-            };
-
-            // Only a crossing of the valid boundary is progress or regression.
-            // `unknown` becoming `timeout` is neither: the goal was not proved
-            // before and is not proved now, and calling that newly unproved
-            // would report a prover getting slower as a proof being lost.
-            if was == now {
-                unchanged_count += 1;
-            } else if now == "valid" {
-                newly_proved.push(row);
-            } else if was == "valid" {
-                newly_unproved.push(row);
-            } else {
-                status_changed.push(row);
-            }
+            ));
         }
-        let disappeared: Vec<serde_json::Value> = before
-            .iter()
-            .filter(|(id, _)| !seen.contains(*id))
-            .map(|(id, was)| json!({"stable_goal_id": id, "was": was}))
-            .collect();
-
-        Ok(json!({
-            "since": since,
-            "newly_proved": newly_proved,
-            "newly_unproved": newly_unproved,
-            "status_changed": status_changed,
-            "appeared": appeared,
-            "disappeared": disappeared,
-            "unchanged_count": unchanged_count,
-        }))
+        Ok(())
     }
 
     pub async fn current_annotations_payload(

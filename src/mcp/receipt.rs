@@ -9,6 +9,7 @@
 //! are comparable exactly when their hashes match.
 
 use super::*;
+use crate::mcp::server::analysis::goal_is_vacuously_proved;
 use crate::state::sha256_hex;
 
 /// What a receipt calls a source file.
@@ -122,6 +123,16 @@ pub fn proof_receipt_goals(
                 // "not cached", which is the direction that hides a replayed
                 // verdict, on the payload the receipt hashes.
                 "from_cache": json!(crate::mcp::server::wpclass::goal_is_from_cache(&goal)),
+
+                // Valid, but only because the hypotheses cannot hold, so the
+                // status alone overstates what was proved. Materialized here
+                // rather than re-derived on read: the property consolidation
+                // goal_is_vacuously_proved reads sits on the enriched goal
+                // above and is gone by the time anything opens the receipt,
+                // leaving the status on its own. A reader counting statuses
+                // without it scores "requires \false" as a discharged
+                // obligation.
+                "vacuously_proved": json!(goal_is_vacuously_proved(&goal)),
                 "fct": crate::mcp::server::wpclass::goal_owner_name(&goal),
 
                 // The function this goal belongs to, so a reader of the receipt
@@ -147,6 +158,45 @@ pub fn proof_receipt_goals(
         a_key.cmp(&b_key)
     });
     receipt_goals
+}
+
+/// Whether a receipt goal's valid verdict survives the vacuity check.
+///
+/// Deliberately not named "is discharged", because it does not answer that in
+/// full. It catches valid_under_false_hypothesis, which is the shape a contract
+/// weakened to "requires \false" produces. It does not catch valid_under_hyp,
+/// where the property rests on something nothing established, nor valid_but_dead,
+/// where it holds because the code is unreachable. Both are the same family of
+/// overstatement arriving through Frama-C's other spellings, and closing them
+/// means widening goal_is_vacuously_proved, which the failure classifier also
+/// uses and where widening costs payload size that function's doc budgets for.
+///
+/// The obvious-looking fix is wrong and has been reached for twice, so it is
+/// written down here. check_goal_counts_as_progress reads the consolidated
+/// property verdict, which is a statement about the property and not about this
+/// goal: one open sibling under the same property marks every goal beneath it
+/// as non-progress, including the ones WP proved outright. Minting that into a
+/// receipt row would score three proved goals out of four as zero and destroy
+/// the per-goal granularity the progress fraction exists to report.
+///
+/// Beside proof_receipt_goals for
+/// the same reason receipt_goals_record_owner is: that function writes both
+/// fields this reads, so a change to what vacuously_proved means moves the
+/// writer and its reader together instead of leaving the name spelled in two
+/// files that agree by habit.
+///
+/// A goal proved only because its hypotheses cannot hold is stamped valid like
+/// any other. Counting bare statuses therefore scores a contract weakened to
+/// "requires \false" as a completed proof, which is the cheapest edit
+/// available to anything optimizing that count.
+pub(crate) fn receipt_goal_is_progress(goal: &serde_json::Value) -> bool {
+    goal.get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_proved)
+        && !goal
+            .get("vacuously_proved")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
 }
 
 /// Whether these receipt goals come from a build that records goal owners.

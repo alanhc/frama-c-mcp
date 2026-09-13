@@ -4607,7 +4607,10 @@ pub mod propose;
 
 #[path = "receipt.rs"]
 pub mod receipt;
-use receipt::{eva_config_absent, incomplete_digest, proof_receipt_goals, ProofReceiptRequest};
+use receipt::{
+    eva_config_absent, incomplete_digest, proof_receipt_goals, receipt_goal_is_progress,
+    ProofReceiptRequest,
+};
 
 #[path = "eacsl.rs"]
 pub mod eacsl;

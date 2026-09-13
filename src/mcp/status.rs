@@ -192,6 +192,16 @@ pub fn add_status_fields(value: &mut Value) {
 /// Exact rather than case-insensitive, unlike is_proved, because the input here
 /// has been through normalize_frama_c_status and a raw "VALID" reaching this
 /// function means a caller skipped that step.
+/// Three functions in this tree ask a version of "did this count as proof", at
+/// three different shapes, and they do not agree because the shapes do not
+/// carry the same information. This one takes a consolidated property status,
+/// so it answers for a property and not for one goal under it.
+/// check_goal_counts_as_progress takes an enriched goal and reads the flag this
+/// writes, inheriting the same property-level scope. receipt_goal_is_progress
+/// takes a receipt row, which has only its own status and a minted vacuity bit.
+/// valid_but_dead separates them: false here and in the enriched form, true at
+/// the receipt row. Pick by the shape in hand, and do not assume a receipt row
+/// can be routed through either of the other two.
 pub fn status_counts_as_progress(normalized: &str) -> bool {
     normalized == "valid"
 }

@@ -188,6 +188,28 @@ fn goals_that_did_not_discharge_are_in_the_denominator() {
 }
 
 #[test]
+fn a_vacuously_valid_goal_is_in_the_denominator_and_not_in_the_numerator() {
+    // The same carve-out the conclusion door and the goal diff make, on the
+    // third reader of the same receipt field. A goal discharged only because
+    // its hypotheses cannot hold is stamped valid, so a status scan counted it
+    // as covered and could call the whole report complete on a contract
+    // weakened to "requires \false". by_status stays a status histogram, so it
+    // still files the goal under valid.
+    let mut vacuous = conclusion("a", VerificationStatus::Verified);
+    vacuous.proof_receipt = Some(receipt(
+        "a",
+        &["a"],
+        json!([{"status": "valid", "from_cache": false, "vacuously_proved": true}]),
+    ));
+    let report = report(&["a"], HashMap::from([("a".into(), vacuous)]), None);
+    assert_eq!(report["goal_coverage"]["total"], 1);
+    assert_eq!(report["goal_coverage"]["valid"], 0);
+    assert_eq!(report["goal_coverage"]["by_status"]["valid"], 1);
+    assert_eq!(report["goal_coverage"]["fresh_valid"], 0);
+    assert_eq!(report["verdict"], "incomplete");
+}
+
+#[test]
 fn a_proof_resting_on_an_unproved_callee_is_not_covered() {
     // Transitive: c is failed, b proved against c's contract, a against b's.
     // Nothing about a's own record is wrong, and it is still resting on a

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mcp::server::receipt::RECEIPT_SCHEMA;
+use crate::mcp::server::receipt::{receipt_goal_is_progress, RECEIPT_SCHEMA};
 
 /// Why a receipt is not evidence this build can stand behind, or None.
 ///
@@ -75,6 +75,32 @@ pub fn proof_receipt_evidence_error(
              recomputed {recomputed}); pass back the receipt this server returned, unchanged"
         ));
     }
+    let Some(files) = receipt.pointer("/subject/files").and_then(|v| v.as_array()) else {
+        return Some("proof_receipt does not carry a source file list".to_string());
+    };
+    // Readability only. Whether subject.source_hash agrees with these entries
+    // is not asked, because the whole-receipt digest above already covers both
+    // of them: a receipt whose outer hash matches is byte-identical to what the
+    // writer emitted, and the writer derives source_hash from this very array.
+    // Only a forgery carrying a correct outer digest and a wrong inner one
+    // could fail such a check, and this function's own preamble puts a
+    // consistently assembled forgery out of scope.
+    //
+    // Unreadable is a different case and stays: it produces a genuine,
+    // correctly hashed receipt with a null digest, so it is reachable in
+    // ordinary use. The sha256 clause is what catches it:
+    // proof_receipt_source_files writes a null digest and an error string
+    // together, so testing the error key as well restated the same condition
+    // and coupled this check to a second field for nothing. A forged receipt
+    // dodges an error key by omitting it and cannot dodge a missing digest.
+    if files.is_empty()
+        || files.iter().any(|file| {
+            file.get("path").and_then(|v| v.as_str()).is_none_or(str::is_empty)
+                || file.get("sha256").and_then(|v| v.as_str()).is_none_or(str::is_empty)
+        })
+    {
+        return Some("proof_receipt has unreadable or malformed source files".to_string());
+    }
     let Some(goals) = receipt.get("goals").and_then(|v| v.as_array()) else {
         return Some("missing proof_receipt goals".to_string());
     };
@@ -84,11 +110,24 @@ pub fn proof_receipt_evidence_error(
     if goals.len() as u32 != goal_total {
         return Some("proof_receipt goal count does not match wp_summary".to_string());
     }
-    if goals
-        .iter()
-        .any(|goal| goal.get("status").and_then(|v| v.as_str()) != Some("valid"))
-    {
-        return Some("proof_receipt goals are not all valid".to_string());
+    // Not a status scan. A goal discharged only because its hypotheses cannot
+    // hold is stamped valid like any other, so a contract weakened to
+    // "requires \false" produced an all-valid receipt, a wp_summary whose
+    // valid equals its total, and a conclusion that stored and reloaded as
+    // Verified. get_wp_goals refuses to call that progress; refusing it here
+    // too is what stops the durable artifact from being the laxer of the pair,
+    // which is the wrong way round: a diff is read once, a conclusion persists
+    // to disk and is believed again next session.
+    //
+    // Receipts written before the field carry no vacuously_proved key and read
+    // as false, so this tightens on new evidence and leaves old evidence
+    // standing rather than demoting a shelf of conclusions on upgrade.
+    if goals.iter().any(|goal| !receipt_goal_is_progress(goal)) {
+        return Some(
+            "proof_receipt goals are not all discharged; a goal is unproved, or proved only \
+             under hypotheses that cannot hold"
+                .to_string(),
+        );
     }
 
     // A sandbox proves an extracted copy of the function whose uncontracted

@@ -225,7 +225,7 @@ the right is the trap that makes the obvious call the wrong one.
 | *"I have no annotations yet. What does the code itself determine?"* | `propose_annotations({function:"bar"})` → `inject_all_annotations({function:"bar", dry_run:true, annotations:[...]})` | Frames only, each already type-checked against the AST. The predicates that make a proof go through are under `not_proposed`, named rather than guessed |
 | *"Type-check this ACSL against the real AST but change nothing."* | `inject_all_annotations({function:"bar", dry_run:true, annotations:[...]})` | Invariants, asserts, `assigns`, ghost code and lemmas all inject on main. `requires` and `ensures` are the exception, refused there whatever `dry_run` says |
 | *"Try requiring `n >= 0` without touching the main project."* | `create_sandbox({function:"bar", experiment_id:"exp42"})` → `inject_all_annotations({sandbox_name:"exp42:bar", annotations:[...]})` → `run_wp({functions:["exp42:bar"]})` | Contracts belong to whoever reviews the source, so main refuses them and the sandbox is where one gets tried. Merge back explicitly |
-| *"Prove `bar` now, and tell me what my last change actually bought."* | `run_wp({functions:["bar"], cache:"None"})` → `get_wp_goals({since:"<earlier receipt sha256>"})` | `-wp-cache` defaults to `update`, so a valid verdict may be replayed rather than computed. `since` only names receipts from this session |
+| *"Prove `bar` now, and tell me what my last change actually bought."* | `run_wp({functions:["bar"], cache:"None"})` → `get_wp_goals({function:"bar", since:"<earlier receipt sha256>"})` | `-wp-cache` defaults to `update`, so a valid verdict may be replayed rather than computed. `progress.fraction_delta` measures the goals both runs share, so the ones your edit added show up under `appeared` instead. `since` requires the same function scope and only names receipts from this session |
 | *"Prove the ready functions, one bounded batch at a time, then record what `bar` assumed."* | `run_wp({functions:["bar"], retry_unproved:true})` → `store_function_conclusion({function:"bar", status:"verified", proof_receipt, wp_summary})` → `list({kind:"conclusions", function:"bar"})` | WP's budget is per call, so an oversized batch returns nothing at all. `verified` is refused unless the receipt's goals are all valid and their count matches `wp_summary` |
 | *"Verify the file bottom up and tell me what to do next."* | `verify_program_step({lock_project:false})` | The lock defaults on and blocks every later `run_wp` on main |
 | *"Does it actually break when it runs?"* | `run_e_acsl({use_current_ast:true, args:[...]})` | Compiles and executes the code with your privileges; trusted source only. Without `use_current_ast` it runs the files on disk, which do not carry this session's annotations |
@@ -520,7 +520,8 @@ session would discard the loaded AST and every annotation injected into it.
 `get_wp_goals` reads the one property table every analysis writes to, selected by
 a `want` array in the idiom `context` uses: `goals` (the default, WP proof
 goals, filtered by `function` and `status`, or diffed against an earlier run
-with `since`), `alarms` (EVA alarms, filtered by `function`, `alarm_kind` or
+with `function` and `since`, which reports the transitions plus a proof-progress
+delta over the goals the two runs share), `alarms` (EVA alarms, filtered by `function`, `alarm_kind` or
 `status`), `counts` (property counts plus EVA and WP state), `vc` (one
 function's verification condition as a sequent), and `investigation` (one
 property joined to its value ranges, callers, and annotations, keyed on

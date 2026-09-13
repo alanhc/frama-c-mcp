@@ -618,7 +618,7 @@ fn verified_requires_auditable_proof_evidence() {
         )),
         ..Default::default()
     });
-    assert!(bad_goal.unwrap_err().contains("not all valid"));
+    assert!(bad_goal.unwrap_err().contains("not all discharged"));
 
     let mismatched_summary = state.store_conclusion(FunctionConclusionUpdate {
         function: "F".into(),

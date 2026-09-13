@@ -20,11 +20,13 @@ fn percent(numerator: usize, denominator: usize) -> f64 {
 
 /// What a receipt's recorded file hashes say about the tree as it is now.
 ///
-/// Nothing else reads "/subject/files" back, so a conclusion stored before an
-/// edit stayed "verified" through any number of rewrites of the body it was
-/// about. stale_dependencies only tracks a callee's contract text and
+/// This is what notices a source edit. proof_receipt_evidence_error also reads
+/// "/subject/files" now, but only to refuse a receipt whose files the server
+/// could not hash at all; it says nothing about whether those files have since
+/// changed. stale_dependencies only tracks a callee's contract text and
 /// stale_proof_environment only moves when some other receipt is stored, so
-/// neither of them sees a function's own source change.
+/// without the comparison below a conclusion stays "verified" through any
+/// number of rewrites of the body it was about.
 ///
 /// A file the receipt named but that cannot be read now is counted rather than
 /// judged. A sandbox receipt outlives the directory it proved, so a missing
@@ -538,7 +540,16 @@ pub fn proof_coverage_report(
                     .unwrap_or("unknown"),
             );
             *by_status.entry(status.clone()).or_default() += 1;
-            if status == "valid" {
+
+            // Not "status == valid". A goal proved only because its hypotheses
+            // cannot hold is stamped valid like any other, so counting the
+            // status scored a contract weakened to "requires \false" as covered
+            // and could report verdict "complete" on it. The conclusion door
+            // and the goal diff both refuse to call that a discharged
+            // obligation; this is the third reader of the same receipt field
+            // and it has no business being the lax one. by_status above stays a
+            // status histogram, because that is what it says it is.
+            if receipt_goal_is_progress(goal) {
                 // Through the accessor, which falls back to the summary where
                 // the lifted field is absent. Reading the key alone called such
                 // a goal freshly proved, which is the flattering direction for

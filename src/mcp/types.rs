@@ -611,8 +611,16 @@ pub struct GetWpGoalsParams {
     #[schemars(skip)]
     pub include_counter_examples: Option<bool>,
     /// Diff against an earlier run, named by its `proof_receipt.sha256`.
-    /// Returns what changed instead of the goal list. Only runs this session
-    /// produced can be named; an unknown hash is an error, not an empty diff.
+    /// Returns exact transitions instead of the goal list, plus
+    /// `progress.fraction_delta`: how much of what both runs were asked to
+    /// prove this one discharges that the earlier one did not, over the goals
+    /// they share. Obligations the edit added are in `appeared` rather than in
+    /// that fraction, and `progress.comparable` says whether the shared set is
+    /// the whole of both. A goal proved only under hypotheses that cannot hold
+    /// counts for neither side. Only runs this session produced can be named;
+    /// an unknown hash is an error, not an empty diff. Requires `function`, and
+    /// the earlier run must have been scoped to that same one. Cannot be
+    /// combined with `status`.
     pub since: Option<String>,
 }
 
