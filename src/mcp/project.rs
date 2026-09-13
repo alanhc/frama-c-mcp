@@ -592,6 +592,10 @@ impl FramaCMcpServer {
             }
         };
 
+        // Before the spawn reads it, so an edit during the analysis that
+        // follows cannot change which machine this load is said to have used.
+        let machdep_digest = super::checkgaps::machdep_digest(project_options.machdep.as_deref());
+
         // Spawns, respawns, or reloads in place as the options require.
         self.ensure_main_spawned(files.clone(), project_options.clone())
             .await?;
@@ -713,6 +717,7 @@ impl FramaCMcpServer {
             "isystem_paths": project_options.isystem_paths,
             "nostdinc": project_options.nostdinc,
             "machdep": project_options.machdep,
+            "machdep_digest": machdep_digest,
             "compilation_database": project_options.compilation_database,
             "source_location_stability": {
                 "checked": previous_markers.is_some() && current_markers.is_some(),

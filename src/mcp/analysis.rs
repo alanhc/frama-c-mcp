@@ -3182,6 +3182,9 @@ impl FramaCMcpServer {
             params.machdep = variant.machdep.clone().or(params.machdep);
             params.model = variant.model.clone().or(params.model);
 
+            let requested_defines = params.defines.clone().unwrap_or_default();
+            let requested_machdep = params.machdep.clone();
+
             let payload = self.check_payload(params).await?;
             let digest = payload
                 .pointer("/proof_receipt/subject/ast_digest")
@@ -3189,25 +3192,27 @@ impl FramaCMcpServer {
                 .map(str::to_string);
 
             // What the load used, not what was asked: the reload fills absent
-            // defines and machdep from verify_profile. Null when no reload ran.
-            let reload_defines = payload.pointer("/reload/defines").cloned();
-            let effective_defines: Vec<String> = reload_defines
-                .as_ref()
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default();
-            let effective_machdep = payload
-                .pointer("/reload/machdep")
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            let effective_machdep_digest = machdep_digest(effective_machdep.as_deref());
+            // defines and machdep from verify_profile. A failed reload records
+            // neither, and then the request is all there is, with no machine
+            // digest because nothing was loaded.
+            let (effective_defines, effective_machdep, effective_machdep_digest) =
+                match payload.get("reload").filter(|reload| reload.get("defines").is_some()) {
+                    Some(reload) => (
+                        serde_json::from_value::<Vec<String>>(reload["defines"].clone())
+                            .unwrap_or_default(),
+                        reload["machdep"].as_str().map(str::to_string),
+                        reload["machdep_digest"].as_str().map(str::to_string),
+                    ),
+                    None => (requested_defines, requested_machdep, None),
+                };
 
             // What the caller varied that could have changed the code. model is
             // deliberately not in it.
-            let ast_inputs = (effective_defines, effective_machdep.clone());
+            let ast_inputs = (effective_defines.clone(), effective_machdep.clone());
 
             let mut entry = json!({
                 "label": label,
-                "defines": reload_defines,
+                "defines": effective_defines,
                 "machdep": effective_machdep,
                 "machdep_digest": effective_machdep_digest,
                 "model": payload.pointer("/wp/effective_wp_config/model").cloned(),

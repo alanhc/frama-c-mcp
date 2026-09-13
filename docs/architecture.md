@@ -255,7 +255,8 @@ caller only reaches it by asking. It carries `verdict`, `variant_count`,
 and `variants[]`. `verdict` is `proved` only when every variant proved, no two
 shared an AST, and every variant had a digest to compare.
 
-Each entry carries its `label`, effective `defines`, `machdep` and `model`, its
+Each entry carries its `label`, the `defines` and `machdep` its reload used
+(the requested ones when the reload failed), its `model`, its
 `machdep_digest`, its own `verdict`, its `incomplete[]` codes as bare strings,
 its `ast_digest`, its `wp_backend_diagnosis`, and the `proof_receipt_sha256` of
 the run. An entry that asked for different code and got a byte-identical AST
@@ -265,9 +266,10 @@ identical goal counts and identical verdicts, so nothing but the normalised AST
 separates a matrix that was really checked from one configuration checked twice.
 
 The machine is part of that comparison because the printed AST omits it.
-`machdep_digest` is the SHA-256 of the machdep file's content, or null when
-`machdep` is a builtin name or absent, in which case the name stands for the
-machine. `distinct_asts` counts the same pairs.
+`machdep_digest` is the SHA-256 of the machdep file's content, read by the
+reload before Frama-C is started, or null when `machdep` is a builtin name or
+absent, in which case the name stands for the machine, or when the reload
+failed. `distinct_asts` counts the same pairs.
 
 ### Compatibility history
 
