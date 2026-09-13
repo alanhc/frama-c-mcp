@@ -770,7 +770,7 @@ outran its budget, and a non-zero count also forces `incomplete`: those variants
 were compared to nothing, and a comparison that did not happen must not read as
 one that happened and found nothing. Field list in
 [docs/architecture.md](docs/architecture.md), under the
-`frama-c-mcp.check-variants.v1` schema this call returns instead of the usual
+`frama-c-mcp.check-variants.v2` schema this call returns instead of the usual
 one.
 
 ### Proof evidence

@@ -8916,7 +8916,7 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
     .await
     .unwrap();
 
-    assert_eq!(result["schema"], "frama-c-mcp.check-variants.v1", "{result:?}");
+    assert_eq!(result["schema"], "frama-c-mcp.check-variants.v2", "{result:?}");
     assert_eq!(result["variant_count"], 4, "{result:?}");
 
     let variants = result["variants"].as_array().expect("variants array");
@@ -9114,6 +9114,81 @@ async fn check_variants_reads_the_machine_a_profile_supplies() {
     );
 
     // Same inputs once the profile is read, so one program and no duplicate.
+    assert_eq!(result["distinct_asts"], 1, "{result:?}");
+    assert_eq!(result["duplicate_ast_count"], 0, "{result:?}");
+    let _ = client.cancel().await;
+}
+
+/// Defines a variant inherits from verify_profile are the defines it ran with.
+///
+/// Spelling the profile's defines and omitting them load the same code, so the
+/// two are one configuration rather than a duplicate of each other.
+#[tokio::test]
+async fn check_variants_reads_the_defines_a_profile_supplies() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("feature.c");
+    std::fs::write(
+        &file,
+        "int feature(void)\n{\n#ifdef FEATURE\n    return 1;\n#else\n    return 0;\n#endif\n}\n",
+    )
+    .expect("write");
+    let file = file.to_str().unwrap().to_string();
+
+    let client = spawn_mcp_client(&file).await;
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [file],
+            "verify_profiles": {
+                "feature": {
+                    "sources": [file],
+                    "functions": ["feature"],
+                    "defines": ["FEATURE"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "feature",
+        "want": ["wp"],
+        "verify_profile": "feature",
+        "variants": [
+            {"label": "explicit", "defines": ["FEATURE"]},
+            {"label": "inherited"}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    assert_eq!(by_label("inherited")["defines"], json!(["FEATURE"]), "{result:?}");
+    assert_eq!(
+        by_label("inherited")["ast_digest"],
+        by_label("explicit")["ast_digest"],
+        "{result:?}"
+    );
+    assert!(
+        by_label("inherited").get("duplicate_ast").is_none(),
+        "the same defines, spelled or inherited, are one configuration: {result:?}"
+    );
     assert_eq!(result["distinct_asts"], 1, "{result:?}");
     assert_eq!(result["duplicate_ast_count"], 0, "{result:?}");
     let _ = client.cancel().await;

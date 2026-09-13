@@ -249,7 +249,7 @@ is 1.9 MB for an 800 KB payload.
 ### A second shape: `check {variants: [...]}`
 
 A call carrying `variants` returns a different top-level payload and says so:
-`schema` is `frama-c-mcp.check-variants.v1`. Nothing above applies to it, and a
+`schema` is `frama-c-mcp.check-variants.v2`. Nothing above applies to it, and a
 caller only reaches it by asking. It carries `verdict`, `variant_count`,
 `distinct_asts`, `duplicate_ast_count`, `ast_digest_unavailable_count`, `reason`
 and `variants[]`. `verdict` is `proved` only when every variant proved, no two
@@ -273,7 +273,7 @@ machine. `distinct_asts` counts the same pairs.
 
 | Version | Date | Change |
 |---|---|---|
-| `frama-c-mcp.check-variants.v1` | 2026-09-13 | Additive: entries gain `machdep_digest`. `duplicate_ast` and `distinct_asts` compare the machine as well as the printed AST, so two machdeps are no longer reported as one configuration |
+| `frama-c-mcp.check-variants.v2` | 2026-09-14 | `duplicate_ast` and `distinct_asts` compare the machine as well as the printed AST, so a machdep sweep that printed one AST now reports two and no duplicate. Entry `defines` and `machdep` are the values the reload used, including those inherited from `verify_profile`. Entries gain `machdep_digest` |
 | `frama-c-mcp.check-variants.v1` | 2026-08-24 | First frozen. Does not change `frama-c-mcp.check.v2`, which is still what a call without `variants` returns |
 | `frama-c-mcp.check.v2` | 2026-08-12 | `want` selects the analyses, so `eva`, `eva_alarms`, `wp` and `wp_goals` are null for a second reason and two codes tell it from a failure. `run_eva` folded in and removed |
 | `frama-c-mcp.check.v1` | 2026-08-12 | First frozen. Thirteen `incomplete[]` codes. `detail` added to the reload-failure payload so both paths carry one field set |

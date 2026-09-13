@@ -1133,7 +1133,7 @@ pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Va
     };
 
     json!({
-        "schema": "frama-c-mcp.check-variants.v1",
+        "schema": "frama-c-mcp.check-variants.v2",
 
         // Not "proved" unless every variant proved AND every pair was actually
         // comparable. Both gaps mean the same thing: the question this tool was
