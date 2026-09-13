@@ -9046,7 +9046,7 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
     .await
     .unwrap();
 
-    assert_eq!(result["schema"], "frama-c-mcp.check-variants.v1", "{result:?}");
+    assert_eq!(result["schema"], "frama-c-mcp.check-variants.v2", "{result:?}");
     assert_eq!(result["variant_count"], 4, "{result:?}");
 
     let variants = result["variants"].as_array().expect("variants array");
@@ -9102,6 +9102,225 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
         result["verdict"], "incomplete",
         "a duplicated configuration must not read as a clean multi-config run: {result:?}"
     );
+    let _ = client.cancel().await;
+}
+
+/// The printed AST does not carry the machine model, so an equal digest under
+/// two machdeps is not the same program.
+///
+/// char-signedness.c prints byte-identically under gcc_x86_64 and the riscv64
+/// machdep beside it, and its assertion holds on only one of them.
+#[tokio::test]
+async fn check_variants_does_not_call_two_machdeps_one_configuration() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let file = format!("{fixtures}/char-signedness.c");
+    let riscv64 = format!("{fixtures}/machdep_gcc_riscv64.yaml");
+
+    // The same YAML under a second path is the same machine, so a copy must
+    // still be reported against the original.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let copy = tmp.path().join("copy.yaml");
+    std::fs::copy(&riscv64, &copy).expect("copy machdep");
+
+    let client = spawn_mcp_client(&file).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "widen",
+        "want": ["wp"],
+        "variants": [
+            {"label": "x86_64", "machdep": "gcc_x86_64"},
+            {"label": "riscv64", "machdep": riscv64},
+            {"label": "riscv64-copy", "machdep": copy.to_str().unwrap()}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    // The two targets disagree, which is the whole reason to compare them. want
+    // is wp only, so a variant that proved everything still carries
+    // EVA_NOT_REQUESTED and nothing else.
+    assert!(
+        by_label("x86_64")["incomplete"].to_string().contains("GOAL_NOT_VALID"),
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("riscv64")["incomplete"],
+        json!(["EVA_NOT_REQUESTED"]),
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("riscv64")["ast_digest"],
+        by_label("x86_64")["ast_digest"],
+        "the fixture no longer prints identically, so it tests nothing: {result:?}"
+    );
+
+    assert!(
+        by_label("riscv64").get("duplicate_ast").is_none(),
+        "a second machine model is not a second run of the first: {result:?}"
+    );
+    assert_eq!(
+        by_label("riscv64-copy")["duplicate_ast"],
+        "riscv64",
+        "{result:?}"
+    );
+    assert_eq!(result["duplicate_ast_count"], 1, "{result:?}");
+    assert_eq!(result["distinct_asts"], 2, "{result:?}");
+    let _ = client.cancel().await;
+}
+
+/// A variant that takes its machdep from verify_profile runs under that
+/// machine, and is reported and compared as running under it.
+#[tokio::test]
+async fn check_variants_reads_the_machine_a_profile_supplies() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let file = format!("{fixtures}/char-signedness.c");
+    let riscv64 = format!("{fixtures}/machdep_gcc_riscv64.yaml");
+
+    let client = spawn_mcp_client(&file).await;
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [file],
+            "verify_profiles": {
+                "rv": {
+                    "sources": [file],
+                    "functions": ["widen"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
+                    "machdep": riscv64
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "widen",
+        "want": ["wp"],
+        "verify_profile": "rv",
+        "variants": [
+            {"label": "profile"},
+            {"label": "explicit", "machdep": riscv64}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    assert_eq!(by_label("profile")["machdep"], json!(riscv64), "{result:?}");
+    assert!(by_label("profile")["machdep_digest"].is_string(), "{result:?}");
+    assert_eq!(
+        by_label("profile")["machdep_digest"],
+        by_label("explicit")["machdep_digest"],
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("profile")["ast_digest"],
+        by_label("explicit")["ast_digest"],
+        "{result:?}"
+    );
+
+    // Same inputs once the profile is read, so one program and no duplicate.
+    assert_eq!(result["distinct_asts"], 1, "{result:?}");
+    assert_eq!(result["duplicate_ast_count"], 0, "{result:?}");
+    let _ = client.cancel().await;
+}
+
+/// Defines a variant inherits from verify_profile are the defines it ran with.
+///
+/// Spelling the profile's defines and omitting them load the same code, so the
+/// two are one configuration rather than a duplicate of each other.
+#[tokio::test]
+async fn check_variants_reads_the_defines_a_profile_supplies() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("feature.c");
+    std::fs::write(
+        &file,
+        "int feature(void)\n{\n#ifdef FEATURE\n    return 1;\n#else\n    return 0;\n#endif\n}\n",
+    )
+    .expect("write");
+    let file = file.to_str().unwrap().to_string();
+
+    let client = spawn_mcp_client(&file).await;
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [file],
+            "verify_profiles": {
+                "feature": {
+                    "sources": [file],
+                    "functions": ["feature"],
+                    "defines": ["FEATURE"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "feature",
+        "want": ["wp"],
+        "verify_profile": "feature",
+        "variants": [
+            {"label": "explicit", "defines": ["FEATURE"]},
+            {"label": "inherited"}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    assert_eq!(by_label("inherited")["defines"], json!(["FEATURE"]), "{result:?}");
+    assert_eq!(
+        by_label("inherited")["ast_digest"],
+        by_label("explicit")["ast_digest"],
+        "{result:?}"
+    );
+    assert!(
+        by_label("inherited").get("duplicate_ast").is_none(),
+        "the same defines, spelled or inherited, are one configuration: {result:?}"
+    );
+    assert_eq!(result["distinct_asts"], 1, "{result:?}");
+    assert_eq!(result["duplicate_ast_count"], 0, "{result:?}");
     let _ = client.cancel().await;
 }
 

@@ -3374,10 +3374,8 @@ impl FramaCMcpServer {
             params.machdep = variant.machdep.clone().or(params.machdep);
             params.model = variant.model.clone().or(params.model);
 
-            // Captured before check_payload takes ownership, so the report
-            // names what this variant actually ran with.
-            let effective_defines = params.defines.clone().unwrap_or_default();
-            let effective_machdep = params.machdep.clone();
+            let requested_defines = params.defines.clone().unwrap_or_default();
+            let requested_machdep = params.machdep.clone();
 
             let payload = self.check_payload(params).await?;
             let digest = payload
@@ -3385,31 +3383,30 @@ impl FramaCMcpServer {
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
 
+            // What the load used, not what was asked: the reload fills absent
+            // defines and machdep from verify_profile. A failed reload records
+            // neither, and then the request is all there is, with no machine
+            // digest because nothing was loaded.
+            let (effective_defines, effective_machdep, effective_machdep_digest) =
+                match payload.get("reload").filter(|reload| reload.get("defines").is_some()) {
+                    Some(reload) => (
+                        serde_json::from_value::<Vec<String>>(reload["defines"].clone())
+                            .unwrap_or_default(),
+                        reload["machdep"].as_str().map(str::to_string),
+                        reload["machdep_digest"].as_str().map(str::to_string),
+                    ),
+                    None => (requested_defines, requested_machdep, None),
+                };
+
             // What the caller varied that could have changed the code. model is
             // deliberately not in it.
             let ast_inputs = (effective_defines.clone(), effective_machdep.clone());
-            let duplicate_of = digest.as_ref().and_then(|d| {
-                digests
-                    .get(d)
-                    .and_then(|groups| {
-                        (!groups.iter().any(|(_, seen_inputs)| seen_inputs == &ast_inputs))
-                            .then(|| groups[0].0.clone())
-                    })
-            });
-            if let Some(d) = digest.clone() {
-                let groups = digests.entry(d).or_default();
-                if !groups
-                    .iter()
-                    .any(|(_, seen_inputs)| seen_inputs == &ast_inputs)
-                {
-                    groups.push((label.clone(), ast_inputs));
-                }
-            }
 
             let mut entry = json!({
                 "label": label,
                 "defines": effective_defines,
                 "machdep": effective_machdep,
+                "machdep_digest": effective_machdep_digest,
                 "model": payload.pointer("/wp/effective_wp_config/model").cloned(),
                 "verdict": payload.get("verdict").cloned().unwrap_or(serde_json::Value::Null),
                 "incomplete": payload
@@ -3432,6 +3429,25 @@ impl FramaCMcpServer {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             });
+
+            // Grouped by program rather than by printed AST, which does not
+            // carry the machine model.
+            let program = variant_program_key(&entry);
+            let duplicate_of = program.as_ref().and_then(|key| {
+                digests.get(key).and_then(|groups| {
+                    (!groups.iter().any(|(_, seen_inputs)| seen_inputs == &ast_inputs))
+                        .then(|| groups[0].0.clone())
+                })
+            });
+            if let Some(key) = program {
+                let groups = digests.entry(key).or_default();
+                if !groups
+                    .iter()
+                    .any(|(_, seen_inputs)| seen_inputs == &ast_inputs)
+                {
+                    groups.push((label.clone(), ast_inputs));
+                }
+            }
             if let (Some(obj), Some(first)) = (entry.as_object_mut(), duplicate_of) {
                 obj.insert("duplicate_ast".to_string(), json!(first));
             }

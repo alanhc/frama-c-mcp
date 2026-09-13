@@ -443,7 +443,7 @@ fn custom_machdep_paths_are_accepted() {
     // Every name "frama-c -machdep help" lists on this Frama-C, so the rule is
     // not tighter than the thing it validates.
     for name in [
-        "avr_16", "avr_8", "gcc_rv64", "gcc_x86_16", "gcc_x86_32", "gcc_x86_64", "macos_arm",
+        "avr_16", "avr_8", "gcc_x86_16", "gcc_x86_32", "gcc_x86_64", "macos_arm",
         "msvc_x86_64", "ppc_32", "x86_16", "x86_32", "x86_64",
     ] {
         assert!(

@@ -16,6 +16,7 @@ use frama_c_mcp::mcp::server::checkgaps::{
     check_blocked_reason,
     check_incomplete_items,
     check_variants_summary,
+    machdep_digest,
     gap_guidance,
     incomplete_guidance,
     memory_model_hypothesis_gap,
@@ -1465,6 +1466,44 @@ fn variant_summary_will_not_call_an_unchecked_matrix_proved() {
     assert_eq!(partial["verdict"], "incomplete", "{partial:?}");
     assert_eq!(partial["ast_digest_unavailable_count"], 1);
     assert_eq!(partial["distinct_asts"], 1);
+}
+
+/// One printed AST under two machines is two programs.
+#[test]
+fn variant_summary_counts_a_machine_model_as_part_of_the_program() {
+    let entry = |label: &str, machdep: &str, machdep_digest: serde_json::Value| {
+        json!({
+            "label": label,
+            "verdict": "proved",
+            "ast_digest": "d0",
+            "machdep": machdep,
+            "machdep_digest": machdep_digest,
+        })
+    };
+
+    let summary = check_variants_summary(vec![
+        entry("x86_64", "gcc_x86_64", serde_json::Value::Null),
+        entry("riscv64", "rv64.yaml", json!("m0")),
+    ]);
+    assert_eq!(summary["distinct_asts"], 2, "{summary:?}");
+    assert_eq!(summary["verdict"], "proved", "{summary:?}");
+
+    // The file's content names the machine, not its path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = tmp.path().join("a.yaml");
+    let second = tmp.path().join("b.yaml");
+    std::fs::write(&first, "sizeof_int: 4\n").expect("write");
+    std::fs::write(&second, "sizeof_int: 4\n").expect("write");
+    let digest = |path: &std::path::Path| machdep_digest(path.to_str());
+    assert!(digest(&first).is_some());
+    assert_eq!(digest(&first), digest(&second));
+
+    std::fs::write(&second, "sizeof_int: 8\n").expect("edit");
+    assert_ne!(digest(&first), digest(&second));
+
+    // A builtin name opens no file and is compared by name.
+    assert_eq!(machdep_digest(Some("gcc_x86_64")), None);
+    assert_eq!(machdep_digest(None), None);
 }
 
 /// A crashed backend is read before the goal it left behind.
