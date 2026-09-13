@@ -1032,6 +1032,28 @@ type AstInputs = (Vec<String>, Option<String>);
 /// group are a model sweep and are not.
 pub(crate) type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
 
+/// The machdep file's content digest, or None for a name that opens no file.
+///
+/// The printed AST omits the machine model: char-signedness.c prints the same
+/// under gcc_x86_64 and a riscv64 YAML and proves on only one. Content rather
+/// than path, so one YAML under two paths is still one machine.
+pub fn machdep_digest(machdep: Option<&str>) -> Option<String> {
+    let file = std::fs::File::open(machdep?).ok()?;
+    crate::state::sha256_hex_of_reader(file).ok().map(|(digest, _)| digest)
+}
+
+/// What two variants must share to have analysed the same program: the printed
+/// AST and the machine it was typed under.
+pub(crate) fn variant_program_key(entry: &serde_json::Value) -> Option<String> {
+    let digest = entry.get("ast_digest")?.as_str()?;
+    let machine = entry
+        .get("machdep_digest")
+        .and_then(|value| value.as_str())
+        .or_else(|| entry.get("machdep").and_then(|value| value.as_str()))
+        .unwrap_or("");
+    Some(format!("{digest}\0{machine}"))
+}
+
 /// The verdict over a finished set of variant entries.
 ///
 /// Free-standing so the decision can be tested without a Frama-C instance: the
@@ -1073,7 +1095,7 @@ pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Va
         .all(|entry| entry.get("verdict").and_then(|v| v.as_str()) == Some("proved"));
     let distinct_asts = results
         .iter()
-        .filter_map(digest_of)
+        .filter_map(variant_program_key)
         .collect::<std::collections::HashSet<_>>()
         .len();
 

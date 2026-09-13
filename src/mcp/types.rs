@@ -518,7 +518,9 @@ pub struct CheckParams {
     /// comparison at all. Entries that differ only in `model` are exempt: no
     /// WP option changes the AST, so a memory-model sweep shares one by design
     /// and flagging it would cry wolf on the comparison this tool most exists
-    /// to support.
+    /// to support. Entries under different machines are never duplicates,
+    /// because the printed AST omits the machine model; a machdep file is
+    /// compared by content.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub variants: Option<Vec<CheckVariant>>,
     /// Path to compile_commands.json. If files is omitted, source files are

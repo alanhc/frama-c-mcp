@@ -751,7 +751,11 @@ the comparison the caller's job, and the comparison is where the mistakes are.
 The result carries `ast_digest` per variant and reports `duplicate_ast` when two
 entries asked for different code and analysed byte-identical ASTs, which no goal
 count can show. Entries differing only in `model` are exempt, since no WP option
-changes the AST and a memory-model sweep is meant to share one. A real
+changes the AST and a memory-model sweep is meant to share one. Entries under
+different machines are never duplicates: the printed AST omits the machine
+model, so `char` is written the same whether the target makes it signed or not.
+A machdep file is compared by content, so one YAML under two paths is one
+machine. A real
 instance, and the reason this is here: a project's verify target ran a default
 pass alongside a `-DTLSF_NO_INTRINSICS` pass and reported both green for
 several rounds. Frama-C does not predefine `__GNUC__`, so the source selected

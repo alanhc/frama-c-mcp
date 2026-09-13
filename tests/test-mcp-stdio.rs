@@ -8975,6 +8975,70 @@ async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
     let _ = client.cancel().await;
 }
 
+/// The printed AST does not carry the machine model, so an equal digest under
+/// two machdeps is not the same program.
+///
+/// char-signedness.c prints byte-identically under gcc_x86_64 and the riscv64
+/// machdep beside it, and its assertion holds on only one of them.
+#[tokio::test]
+async fn check_variants_does_not_call_two_machdeps_one_configuration() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let file = format!("{fixtures}/char-signedness.c");
+    let riscv64 = format!("{fixtures}/machdep_gcc_riscv64.yaml");
+
+    // The same YAML under a second path is the same machine, so a copy must
+    // still be reported against the original.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let copy = tmp.path().join("copy.yaml");
+    std::fs::copy(&riscv64, &copy).expect("copy machdep");
+
+    let client = spawn_mcp_client(&file).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "widen",
+        "want": ["wp"],
+        "variants": [
+            {"label": "x86_64", "machdep": "gcc_x86_64"},
+            {"label": "riscv64", "machdep": riscv64},
+            {"label": "riscv64-copy", "machdep": copy.to_str().unwrap()}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+    let codes = |name: &str| by_label(name)["incomplete"].to_string();
+
+    // The two targets disagree, which is the whole reason to compare them.
+    assert!(codes("x86_64").contains("GOAL_NOT_VALID"), "{result:?}");
+    assert!(!codes("riscv64").contains("GOAL_NOT_VALID"), "{result:?}");
+    assert_eq!(
+        by_label("riscv64")["ast_digest"],
+        by_label("x86_64")["ast_digest"],
+        "the fixture no longer prints identically, so it tests nothing: {result:?}"
+    );
+
+    assert!(
+        by_label("riscv64").get("duplicate_ast").is_none(),
+        "a second machine model is not a second run of the first: {result:?}"
+    );
+    assert_eq!(
+        by_label("riscv64-copy")["duplicate_ast"],
+        "riscv64",
+        "{result:?}"
+    );
+    assert_eq!(result["duplicate_ast_count"], 1, "{result:?}");
+    assert_eq!(result["distinct_asts"], 2, "{result:?}");
+    let _ = client.cancel().await;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // What the parse itself cost
 //

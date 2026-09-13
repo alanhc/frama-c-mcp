@@ -256,18 +256,24 @@ and `variants[]`. `verdict` is `proved` only when every variant proved, no two
 shared an AST, and every variant had a digest to compare.
 
 Each entry carries its `label`, effective `defines`, `machdep` and `model`, its
-own `verdict`, its `incomplete[]` codes as bare strings, its `ast_digest`, its
-`wp_backend_diagnosis`, and the `proof_receipt_sha256` of the run. An entry that
-asked for different code and got a byte-identical AST gains `duplicate_ast`
-naming the earlier entry. The digests are the point: two configurations that
-select the same code produce identical goal counts and identical verdicts, so
-nothing but the normalised AST separates a matrix that was really checked from
-one configuration checked twice.
+`machdep_digest`, its own `verdict`, its `incomplete[]` codes as bare strings,
+its `ast_digest`, its `wp_backend_diagnosis`, and the `proof_receipt_sha256` of
+the run. An entry that asked for different code and got a byte-identical AST
+under the same machine gains `duplicate_ast` naming the earlier entry. The
+digests are the point: two configurations that select the same code produce
+identical goal counts and identical verdicts, so nothing but the normalised AST
+separates a matrix that was really checked from one configuration checked twice.
+
+The machine is part of that comparison because the printed AST omits it.
+`machdep_digest` is the SHA-256 of the machdep file's content, or null when
+`machdep` is a builtin name or absent, in which case the name stands for the
+machine. `distinct_asts` counts the same pairs.
 
 ### Compatibility history
 
 | Version | Date | Change |
 |---|---|---|
+| `frama-c-mcp.check-variants.v1` | 2026-09-13 | Additive: entries gain `machdep_digest`. `duplicate_ast` and `distinct_asts` compare the machine as well as the printed AST, so two machdeps are no longer reported as one configuration |
 | `frama-c-mcp.check-variants.v1` | 2026-08-24 | First frozen. Does not change `frama-c-mcp.check.v2`, which is still what a call without `variants` returns |
 | `frama-c-mcp.check.v2` | 2026-08-12 | `want` selects the analyses, so `eva`, `eva_alarms`, `wp` and `wp_goals` are null for a second reason and two codes tell it from a failure. `run_eva` folded in and removed |
 | `frama-c-mcp.check.v1` | 2026-08-12 | First frozen. Thirteen `incomplete[]` codes. `detail` added to the reload-failure payload so both paths carry one field set |
