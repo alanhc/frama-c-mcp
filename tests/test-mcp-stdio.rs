@@ -1598,6 +1598,18 @@ async fn wp_goals_diff_against_an_earlier_run() {
         .as_str()
         .expect("receipt hash")
         .to_string();
+    let unchanged = call_tool_json(&client, "get_wp_goals", json!({
+        "function": "abs_int",
+        "since": receipt,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(unchanged["progress"]["comparable"], true, "{unchanged:?}");
+    assert_eq!(unchanged["progress"]["fraction_delta"], 0.0, "{unchanged:?}");
+    let unscoped = call_tool_json(&client, "get_wp_goals", json!({"since": receipt}))
+        .await
+        .expect_err("an unscoped current run is not comparable to a scoped receipt");
+    assert!(unscoped.to_string().contains("function is required"), "{unscoped:?}");
 
     // An assert carrying what the precondition used to say, since a contract
     // cannot be injected into the main project. It discharges the overflow the
@@ -1650,6 +1662,50 @@ async fn wp_goals_diff_against_an_earlier_run() {
         diff["unchanged_count"].as_u64().is_some_and(|n| n > 0),
         "{diff:?}"
     );
+    let before_progress = &diff["progress"]["before"];
+    let current_progress = &diff["progress"]["current"];
+    assert_eq!(diff["progress"]["comparable"], false, "{diff:?}");
+
+    // The set moved and the delta is still a number, which is the whole point
+    // of measuring it over the goals both runs hold: the assertion's own goal
+    // is reported under "appeared" and stays out of the denominator, so the
+    // one obligation that went from open to discharged is exactly what the
+    // fraction moves by.
+    assert_eq!(
+        diff["progress"]["shared_total"].as_u64(),
+        before_progress["total"].as_u64(),
+        "every earlier goal survives the edit: {diff:?}"
+    );
+    let shared_total = before_progress["total"].as_f64().expect("shared total");
+    assert!(
+        (diff["progress"]["fraction_delta"].as_f64().expect("a delta") - 1.0 / shared_total).abs()
+            < 1e-9,
+        "one of the shared goals became valid: {diff:?}"
+    );
+    assert_eq!(
+        current_progress["total"].as_u64(),
+        before_progress["total"].as_u64().map(|total| total + 1),
+        "the assertion adds one obligation: {diff:?}"
+    );
+    assert_eq!(
+        current_progress["proved"].as_u64(),
+        before_progress["proved"].as_u64().map(|proved| proved + 1),
+        "one old goal becomes valid: {diff:?}"
+    );
+    assert!(
+        current_progress["fraction"].as_f64().unwrap_or_default()
+            > before_progress["fraction"].as_f64().unwrap_or_default(),
+        "proof progress should increase: {diff:?}"
+    );
+
+    let filtered = call_tool_json(&client, "get_wp_goals", json!({
+        "function": "abs_int",
+        "status": "unproved",
+        "since": receipt,
+    }))
+    .await
+    .expect_err("a status-filtered current run is not comparable to the full receipt");
+    assert!(filtered.to_string().contains("status cannot be combined"), "{filtered:?}");
 
     // A reload drops the remembered runs along with the AST they described, so
     // the same hash stops resolving rather than being diffed against goals from
@@ -1677,6 +1733,80 @@ async fn wp_goals_diff_against_an_earlier_run() {
     .await
     .expect_err("an unknown receipt must be refused");
     assert!(unknown.contains("this session"), "{unknown}");
+
+    let _ = client.cancel().await;
+}
+
+/// A sandbox run can be diffed against its own earlier receipt.
+///
+/// The scope check "since" performs compares the name the caller used against
+/// the one run_wp recorded, and a sandbox has two names for one function: the
+/// qualified "exp:abs_int" the caller types and lands in wp_config.functions,
+/// and the bare "abs_int" the sandbox process knows it by. Comparing the wrong
+/// pair rejected every sandbox diff with "not scoped to function", which is the
+/// CEGIS loop, the one place a per-step delta is worth having.
+#[tokio::test]
+async fn wp_goals_diff_inside_a_sandbox() {
+    let fixture = workspace_path("tests/fixtures/abs-int-buggy.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+
+    let created = call_tool_json(&client, "create_sandbox", json!({
+        "function": "abs_int",
+        "experiment_id": unique_experiment_id("wpdiff"),
+    }))
+    .await
+    .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox name").to_string();
+
+    let before = call_tool_json(&client, "run_wp", json!({
+        "functions": [&sandbox],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(before["effective_wp_config"]["scope"], "sandbox", "{before:?}");
+    let receipt = before["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("receipt hash")
+        .to_string();
+
+    let unchanged = call_tool_json(&client, "get_wp_goals", json!({
+        "function": &sandbox,
+        "since": &receipt,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(unchanged["progress"]["comparable"], true, "{unchanged:?}");
+    assert_eq!(unchanged["progress"]["fraction_delta"], 0.0, "{unchanged:?}");
+    let shared = unchanged["progress"]["shared_total"].as_u64().expect("shared total");
+    assert!(shared > 0, "the sandbox proves something: {unchanged:?}");
+
+    // The precondition main refuses, tried where it is allowed. It rules out
+    // INT_MIN, which is what makes the negation's overflow goal dischargeable.
+    let injected = call_tool_json(&client, "inject_all_annotations", json!({
+        "sandbox_name": &sandbox,
+        "annotations": [
+            {"kind": "requires", "acsl": "x > -2147483648", "purpose": "fix"}
+        ],
+    }))
+    .await
+    .unwrap();
+    assert_eq!(injected["status"], "success", "{injected:?}");
+    call_tool_json(&client, "run_wp", json!({"functions": [&sandbox], "timeout": 5}))
+        .await
+        .unwrap();
+
+    let diff = call_tool_json(&client, "get_wp_goals", json!({
+        "function": &sandbox,
+        "since": &receipt,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(diff["since"], json!(receipt), "{diff:?}");
+    assert!(
+        diff["progress"]["fraction_delta"].as_f64().is_some_and(|delta| delta > 0.0),
+        "the precondition buys proof progress: {diff:?}"
+    );
 
     let _ = client.cancel().await;
 }

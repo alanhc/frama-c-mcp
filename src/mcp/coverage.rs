@@ -540,6 +540,7 @@ pub fn proof_coverage_report(
                     .unwrap_or("unknown"),
             );
             *by_status.entry(status.clone()).or_default() += 1;
+
             // Not "status == valid". A goal proved only because its hypotheses
             // cannot hold is stamped valid like any other, so counting the
             // status scored a contract weakened to "requires \false" as covered

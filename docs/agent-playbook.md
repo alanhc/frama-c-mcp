@@ -108,8 +108,13 @@ Common failure branch: if dry-run reports failures, fix the proposed ACSL before
 
 After an edit, `get_wp_goals {function, since: "<proof_receipt.sha256>"}`
 answers what changed rather than what exists: `newly_proved`,
-`newly_unproved`, `status_changed`, `appeared`, `disappeared`, and
-`unchanged_count`. Take the hash from the `proof_receipt` of the run you are
+`newly_unproved`, `status_changed`, `appeared`, `disappeared`,
+`unchanged_count`, and a `progress` block whose `fraction_delta` scores the
+move over the goals both runs share, with `comparable` saying whether that
+shared set is the whole of both. `function` is required and must name the same
+scope the earlier run was made under, and `status` cannot be combined with
+`since`, because a filtered current side would diff against an unfiltered
+receipt. Take the hash from the `proof_receipt` of the run you are
 comparing against. Only runs from this session can be named, and an unknown
 hash is an error rather than an empty diff, so a reload or a restart means
 starting from a fresh baseline instead of silently reporting no change.

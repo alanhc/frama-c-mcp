@@ -4,7 +4,9 @@ use crate::server_fixture::lazy_server;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
 use frama_c_mcp::mcp::server::property_status_map;
-use frama_c_mcp::mcp::server::analysis::{profile_covers_exactly, profile_matches_loaded_project};
+use frama_c_mcp::mcp::server::analysis::{
+    profile_covers_exactly, profile_matches_loaded_project, proof_goal_diff,
+};
 use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
 use frama_c_mcp::mcp::server::wpclass::*;
 use frama_c_mcp::mcp::server::WpRunResponse;
@@ -36,7 +38,6 @@ fn wp_response(run: WpRun<'_>) -> serde_json::Value {
         host_load: HostLoad::Load(0.1),
     })
 }
-
 
 use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::receipt::{
@@ -985,6 +986,51 @@ fn an_absent_eva_config_says_which_absence_it_is() {
 // and profile_evidence_error silently falls back to counting the whole array,
 // which is the loose rule that let an emptied target pass on its neighbours'
 // obligations, with every gate still green.
+#[test]
+fn proof_goal_diff_preserves_duplicate_ids() {
+    let real = json!({"stable_goal_id": "g", "status": "valid"});
+    let vacuous = json!({
+        "stable_goal_id": "g",
+        "status": "valid",
+        "vacuously_proved": true,
+    });
+    let diff = proof_goal_diff(
+        "receipt",
+        &[real.clone(), vacuous.clone()],
+        &[vacuous, real],
+    );
+
+    assert_eq!(diff["progress"]["shared_total"], 2);
+    assert_eq!(diff["progress"]["fraction_delta"], 0.0);
+    assert_eq!(diff["unchanged_count"], 2);
+    assert_eq!(diff["appeared"], json!([]));
+    assert_eq!(diff["disappeared"], json!([]));
+}
+
+#[test]
+fn proof_goal_diff_reports_vacuity_transitions() {
+    let real = json!({"stable_goal_id": "g", "status": "valid"});
+    let vacuous = json!({
+        "stable_goal_id": "g",
+        "status": "valid",
+        "vacuously_proved": true,
+    });
+
+    let gained = proof_goal_diff(
+        "receipt",
+        std::slice::from_ref(&vacuous),
+        std::slice::from_ref(&real),
+    );
+    assert_eq!(gained["progress"]["fraction_delta"], 1.0);
+    assert_eq!(gained["newly_proved"].as_array().map(Vec::len), Some(1));
+    assert_eq!(gained["unchanged_count"], 0);
+
+    let lost = proof_goal_diff("receipt", &[real], &[vacuous]);
+    assert_eq!(lost["progress"]["fraction_delta"], -1.0);
+    assert_eq!(lost["newly_unproved"].as_array().map(Vec::len), Some(1));
+    assert_eq!(lost["unchanged_count"], 0);
+}
+
 #[test]
 fn a_receipt_goal_records_the_function_it_belongs_to() {
     use frama_c_mcp::mcp::server::receipt::receipt_goals_record_owner;

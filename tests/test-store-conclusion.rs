@@ -193,7 +193,6 @@ fn a_conclusion_from_another_build_loads_as_unverified() {
         discharge_error
     );
 
-
     // The count branch has no fixture on disk, because a conclusion whose
     // wp_summary disagrees with its own receipt is a different defect from the
     // two above. It is named here so the branch is not the only one untested.
