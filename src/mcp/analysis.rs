@@ -3185,7 +3185,18 @@ impl FramaCMcpServer {
             // Captured before check_payload takes ownership, so the report
             // names what this variant actually ran with.
             let effective_defines = params.defines.clone().unwrap_or_default();
-            let effective_machdep = params.machdep.clone();
+
+            // The reload fills an absent machdep from verify_profile, so the
+            // machine this variant runs under has to be resolved the same way.
+            let effective_machdep = match (&params.machdep, &params.verify_profile) {
+                (Some(machdep), _) => Some(machdep.clone()),
+                (None, Some(name)) => self
+                    .verify_profile_named(name)
+                    .await
+                    .ok()
+                    .and_then(|profile| profile.machdep),
+                (None, None) => None,
+            };
 
             // Read before the run, like the files Frama-C is about to parse.
             let effective_machdep_digest = machdep_digest(effective_machdep.as_deref());

@@ -520,7 +520,9 @@ pub struct CheckParams {
     /// and flagging it would cry wolf on the comparison this tool most exists
     /// to support. Entries under different machines are never duplicates,
     /// because the printed AST omits the machine model; a machdep file is
-    /// compared by content.
+    /// compared by content and a builtin by name. An omitted machdep compares
+    /// as its own machine, so it is not checked against an explicit `x86_64`
+    /// even though that is Frama-C's default.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub variants: Option<Vec<CheckVariant>>,
     /// Path to compile_commands.json. If files is omitted, source files are

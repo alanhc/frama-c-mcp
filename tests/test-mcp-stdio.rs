@@ -9014,11 +9014,19 @@ async fn check_variants_does_not_call_two_machdeps_one_configuration() {
             .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
             .clone()
     };
-    let codes = |name: &str| by_label(name)["incomplete"].to_string();
 
-    // The two targets disagree, which is the whole reason to compare them.
-    assert!(codes("x86_64").contains("GOAL_NOT_VALID"), "{result:?}");
-    assert!(!codes("riscv64").contains("GOAL_NOT_VALID"), "{result:?}");
+    // The two targets disagree, which is the whole reason to compare them. want
+    // is wp only, so a variant that proved everything still carries
+    // EVA_NOT_REQUESTED and nothing else.
+    assert!(
+        by_label("x86_64")["incomplete"].to_string().contains("GOAL_NOT_VALID"),
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("riscv64")["incomplete"],
+        json!(["EVA_NOT_REQUESTED"]),
+        "{result:?}"
+    );
     assert_eq!(
         by_label("riscv64")["ast_digest"],
         by_label("x86_64")["ast_digest"],
@@ -9036,6 +9044,78 @@ async fn check_variants_does_not_call_two_machdeps_one_configuration() {
     );
     assert_eq!(result["duplicate_ast_count"], 1, "{result:?}");
     assert_eq!(result["distinct_asts"], 2, "{result:?}");
+    let _ = client.cancel().await;
+}
+
+/// A variant that takes its machdep from verify_profile runs under that
+/// machine, and is reported and compared as running under it.
+#[tokio::test]
+async fn check_variants_reads_the_machine_a_profile_supplies() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let file = format!("{fixtures}/char-signedness.c");
+    let riscv64 = format!("{fixtures}/machdep_gcc_riscv64.yaml");
+
+    let client = spawn_mcp_client(&file).await;
+    call_tool_json(
+        &client,
+        "reload_project",
+        json!({
+            "files": [file],
+            "verify_profiles": {
+                "rv": {
+                    "sources": [file],
+                    "functions": ["widen"],
+                    "model": "Typed+nocast",
+                    "provers": ["alt-ergo"],
+                    "timeout_seconds": 10,
+                    "rte": false,
+                    "nostdinc": false,
+                    "machdep": riscv64
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "widen",
+        "want": ["wp"],
+        "verify_profile": "rv",
+        "variants": [
+            {"label": "profile"},
+            {"label": "explicit", "machdep": riscv64}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    assert_eq!(by_label("profile")["machdep"], json!(riscv64), "{result:?}");
+    assert!(by_label("profile")["machdep_digest"].is_string(), "{result:?}");
+    assert_eq!(
+        by_label("profile")["machdep_digest"],
+        by_label("explicit")["machdep_digest"],
+        "{result:?}"
+    );
+    assert_eq!(
+        by_label("profile")["ast_digest"],
+        by_label("explicit")["ast_digest"],
+        "{result:?}"
+    );
+
+    // Same inputs once the profile is read, so one program and no duplicate.
+    assert_eq!(result["distinct_asts"], 1, "{result:?}");
+    assert_eq!(result["duplicate_ast_count"], 0, "{result:?}");
     let _ = client.cancel().await;
 }
 
