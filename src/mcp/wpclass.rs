@@ -11,28 +11,37 @@ pub fn classify_wp_goal(goal: &serde_json::Value) -> (String, Option<String>) {
         regex::Regex::new(r"\b((?:re|en|as|li|la|lv|at|an)_[0-9a-f]{8})(?:\b|_)").unwrap()
     });
 
-    let name = goal.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = goal
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let name_lc = name.to_ascii_lowercase();
 
     // RTE class (obligation automatically inserted by WP; the name contains
     // feature keywords)
-    if name_lc.contains("signed_overflow") || name_lc.contains("unsigned_overflow")
-        || name_lc.contains("integer_overflow") || name_lc.contains("downcast")
+    if name_lc.contains("signed_overflow")
+        || name_lc.contains("unsigned_overflow")
+        || name_lc.contains("integer_overflow")
+        || name_lc.contains("downcast")
     {
         return ("rte_overflow".into(), None);
     }
-    if name_lc.contains("index_in_bound") || name_lc.contains("index_bound")
+    if name_lc.contains("index_in_bound")
+        || name_lc.contains("index_bound")
         || name_lc.contains("array_bound")
     {
         return ("rte_bound".into(), None);
     }
-    if name_lc.contains("division_by_zero") || name_lc.contains("div_by_zero")
+    if name_lc.contains("division_by_zero")
+        || name_lc.contains("div_by_zero")
         || name_lc.contains("modulo")
     {
         return ("rte_division".into(), None);
     }
-    if name_lc.contains("mem_access") || name_lc.contains("initialization")
-        || name_lc.contains("dangling") || name_lc.contains("pointer_validity")
+    if name_lc.contains("mem_access")
+        || name_lc.contains("initialization")
+        || name_lc.contains("dangling")
+        || name_lc.contains("pointer_validity")
     {
         return ("rte_pointer".into(), None);
     }
@@ -134,9 +143,15 @@ fn classify_failure_reason(
             "Run self_check and inspect Frama-C request compatibility before changing annotations.",
         )
     } else if normalized_status == "failed"
-        || ["internal", "exception", "rejected", "server error", "plugin error"]
-            .iter()
-            .any(|needle| text.contains(needle))
+        || [
+            "internal",
+            "exception",
+            "rejected",
+            "server error",
+            "plugin error",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
     {
         // Where a Why3 abort lands, and the reason there is no branch above
         // matching the abort text: the goal record does not carry it. WP words
@@ -168,9 +183,14 @@ fn classify_failure_reason(
              which no goal carries, and it is the fallback for the goals whose property row \
              supplied no predicate to copy.",
         )
-    } else if ["unsupported", "unbound", "unknown predicate", "unknown logic"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    } else if [
+        "unsupported",
+        "unbound",
+        "unknown predicate",
+        "unknown logic",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
     {
         push_evidence("goal_text", json!(name));
         (
@@ -303,10 +323,8 @@ pub fn classify_wp_failure_from_goal(
     goal: &serde_json::Value,
     function: Option<&str>,
 ) -> serde_json::Value {
-    let normalized_status = crate::mcp::status::consolidated_status(goal)
-        .unwrap_or("unknown");
-    let raw_status = crate::mcp::status::raw_status(goal)
-        .unwrap_or(normalized_status);
+    let normalized_status = crate::mcp::status::consolidated_status(goal).unwrap_or("unknown");
+    let raw_status = crate::mcp::status::raw_status(goal).unwrap_or(normalized_status);
     let inferred_goal_kind;
     let goal_kind = if let Some(kind) = goal.get("goal_kind").and_then(|value| value.as_str()) {
         kind
@@ -315,7 +333,10 @@ pub fn classify_wp_failure_from_goal(
         inferred_goal_kind = kind;
         inferred_goal_kind.as_str()
     };
-    let name = goal.get("name").and_then(|value| value.as_str()).unwrap_or("");
+    let name = goal
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let property = goal
         .get("property")
         .or_else(|| goal.get("property_marker"))
@@ -339,7 +360,7 @@ pub fn classify_wp_failure_from_goal(
         goal_kind,
         name,
         &text,
-        goal_is_from_cache(goal),
+        goal_is_from_cache(goal) == Some(true),
         &mut push_evidence,
     );
     let failure_kind = wp_failure_kind(category, triage_kind);
@@ -581,7 +602,10 @@ pub fn proofread_drop_stale_retry_advice(
                  of. Read the VC, or supply the contract the obligation needs."
             ),
         );
-        if let Some(evidence) = object.get_mut("evidence").and_then(|value| value.as_array_mut()) {
+        if let Some(evidence) = object
+            .get_mut("evidence")
+            .and_then(|value| value.as_array_mut())
+        {
             evidence.push(json!({
                 "field": "timeout_retry",
                 "value": "retried at double the timeout, still unproved",
@@ -620,8 +644,14 @@ pub fn proofread_report_with_basis(
     basis: &str,
 ) -> serde_json::Value {
     findings.sort_by(|a, b| {
-        let a_severity = a.get("severity").and_then(|value| value.as_str()).unwrap_or("info");
-        let b_severity = b.get("severity").and_then(|value| value.as_str()).unwrap_or("info");
+        let a_severity = a
+            .get("severity")
+            .and_then(|value| value.as_str())
+            .unwrap_or("info");
+        let b_severity = b
+            .get("severity")
+            .and_then(|value| value.as_str())
+            .unwrap_or("info");
         proofread_severity_rank(b_severity)
             .cmp(&proofread_severity_rank(a_severity))
             .then_with(|| {
@@ -661,10 +691,12 @@ pub fn proofread_report_with_basis(
     // "unknown" and an absent line sorts last. A finding with no id is left
     // alone rather than collapsed with every other id-less row.
     let mut seen_ids = std::collections::HashSet::new();
-    findings.retain(|finding| match finding.get("id").and_then(|value| value.as_str()) {
-        Some(id) => seen_ids.insert(id.to_string()),
-        None => true,
-    });
+    findings.retain(
+        |finding| match finding.get("id").and_then(|value| value.as_str()) {
+            Some(id) => seen_ids.insert(id.to_string()),
+            None => true,
+        },
+    );
 
     let top = findings.first();
     let markdown = findings
@@ -881,11 +913,15 @@ fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
         "internal_error" => "Frama-C or WP reported an internal failure for this obligation.",
         "unsupported_predicate" => "The proof uses logic that WP could not handle.",
         "callee_requires_too_strict" => "The caller has not established the callee precondition.",
-        "callee_contract_too_weak" => "The callee contract does not expose enough postcondition information.",
+        "callee_contract_too_weak" => {
+            "The callee contract does not expose enough postcondition information."
+        }
         "incomplete_behavior_partition" => "WP reported an open behavior partition obligation.",
         "weak_loop_assigns" => "The loop frame does not cover the writes WP must reason about.",
         "weak_loop_variant" => "The loop termination variant is still unproved.",
-        "weak_loop_invariant" => "The loop invariant does not establish or preserve the needed property.",
+        "weak_loop_invariant" => {
+            "The loop invariant does not establish or preserve the needed property."
+        }
         "bad_assigns" => "The assigns frame does not match the writes WP observes.",
         "weak_ensures" => "The postcondition is still unproved for this function.",
         "missing_requires" => "The precondition is too weak for this proof obligation.",
@@ -991,9 +1027,7 @@ fn stable_goal_part_key(goal: &serde_json::Value) -> String {
     // The digit check keeps a function named `parse_partition` from donating a
     // tail that WP never generated.
     match wpo.rsplit_once("_part") {
-        Some((_, digits))
-            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
-        {
+        Some((_, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
             format!("_part{digits}")
         }
         _ => String::new(),
@@ -1072,38 +1106,64 @@ pub fn goal_owner_name(goal: &serde_json::Value) -> Option<&str> {
 }
 
 /// Whether WP replayed this goal's verdict from its cache instead of proving
-/// it in this run.
+/// it in this run, or None when nothing said.
 ///
-/// The only signal Frama-C gives is the word in `stats.summary`, a free-form
-/// string that reads `(Qed 31ms) (Alt-Ergo 37ms) (Cached)`. Measured on 33.0:
-/// with the cache off no summary mentions it, with `Update` the
-/// prover-discharged goals all do, and the statuses are identical either way.
-/// So the cache changes only where a verdict came from, which is exactly what
-/// a proof receipt has to record.
-pub fn goal_is_from_cache(goal: &serde_json::Value) -> bool {
-    // The lifted field first. enrich_goal_stable_id puts it on every goal whose
-    // summary it could read, so no consumer has to know the answer comes from a
-    // word in a free-form string, and this function is a consumer like any
-    // other. Reading only the summary meant an enriched goal whose stats had
-    // been projected away answered "not cached", which is the confident
-    // direction and the one that hides a replayed verdict.
-    if let Some(lifted) = goal.get("from_cache").and_then(serde_json::Value::as_bool) {
-        return lifted;
-    }
-    summary_says_cached(goal)
+/// The field is written by apply_cache_provenance from the plug-in's
+/// getGoalCacheStats, which reads the cached flag of the result WP's own
+/// VCS.best selects. It was read off the word "(Cached)" in the free-form
+/// stats summary until 2026-09-16, and that was wrong in the mode nearly every
+/// call runs in: Stats.pp_stats prints it for every cacheable goal whenever the
+/// cache mode is updating, hit or miss, so a freshly computed proof reported as
+/// replayed. Measured on 42 goals of tutorial/verker-string.c: the flag is set
+/// for none on a cold cache and for the 18 prover-discharged goals on a warm
+/// one.
+///
+/// None means unknown, not false: a plug-in too old to answer, a request that
+/// failed, or a goal it did not know. A caller must not count it as either.
+pub fn goal_is_from_cache(goal: &serde_json::Value) -> Option<bool> {
+    // The field and nothing else. There is deliberately no second source to
+    // fall back to: the only other reading available was the "(Cached)" word in
+    // the stats summary, and that word answers a different question, so a
+    // fallback would turn "the plug-in did not say" into a confident wrong
+    // answer rather than into None. A goal that never passed through
+    // apply_cache_provenance carries no field, and unknown is the honest
+    // reading of that.
+    goal.get("from_cache")?.as_bool()
 }
 
-/// The reading straight off the summary, with no lifted field consulted.
+/// Set each goal's from_cache from the plug-in's answer, or null.
 ///
-/// Separate from goal_is_from_cache because the enrichment that writes the
-/// field must not read it: doing so made the first enrichment's answer
-/// permanent while the reader above treated it as authoritative, so a goal
-/// enriched before its stats arrived could never be corrected.
-fn summary_says_cached(goal: &serde_json::Value) -> bool {
-    goal.get("stats")
-        .and_then(|stats| stats.get("summary"))
-        .and_then(|summary| summary.as_str())
-        .is_some_and(|summary| summary.contains("(Cached)"))
+/// Called after every goal fetch, with the rows getGoalCacheStats returned.
+/// A goal the plug-in did not answer for gets null rather than no field, so a
+/// consumer reads "unknown" rather than falling back to a guess.
+pub fn apply_cache_provenance(goals: &mut [serde_json::Value], stats: &serde_json::Value) {
+    // The plug-in request is a signature request, so its named outputs arrive
+    // under "result"; a bare object is accepted too, which is what a unit test
+    // passes.
+    let stats = stats.get("result").unwrap_or(stats);
+    let rows = stats.get("goals").and_then(serde_json::Value::as_array);
+
+    // Indexed once rather than scanned per goal. The plug-in answers with one
+    // row per goal asked about, so a scan made this quadratic in the goal count
+    // on every fetch, and a whole-project run reaches a few thousand.
+    let by_wpo: std::collections::HashMap<&str, &serde_json::Value> = rows
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row.get("wpo")?.as_str()?, row)))
+        .collect();
+    for goal in goals.iter_mut() {
+        let answer = goal
+            .get("wpo")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|wpo| by_wpo.get(wpo))
+            .and_then(|row| row.get("best_result_cached").cloned());
+        if let Some(obj) = goal.as_object_mut() {
+            obj.insert(
+                "from_cache".to_string(),
+                answer.unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
 }
 
 pub fn enrich_goal_stable_id(
@@ -1113,20 +1173,13 @@ pub fn enrich_goal_stable_id(
 ) {
     let stable_goal_id = stable_goal_id_for(goal, goal_kind, stable_scope);
 
-    // Lifted onto the goal here because every goal passes through, so no
-    // consumer has to know it comes from a word in a free-form summary string.
-    //
-    // Written only where there is a summary to project, and overwritten rather
-    // than filled in. A goal with no stats yet gets no field, so it falls
-    // through to the summary read like an unenriched one instead of carrying an
-    // invented "false" that outranks a summary arriving later.
-    let summary_answer = goal.get("stats").is_some().then(|| summary_says_cached(goal));
+    // No from_cache here. It used to be projected out of the stats summary at
+    // this point, and that reading was wrong; apply_cache_provenance writes the
+    // field now, from the plug-in, on every goal fetch. Enriching it here too
+    // would give a goal two answers whose disagreement nothing could resolve.
     if let Some(obj) = goal.as_object_mut() {
         obj.entry("stable_goal_id".to_string())
             .or_insert_with(|| serde_json::Value::String(stable_goal_id));
-        if let Some(from_cache) = summary_answer {
-            obj.insert("from_cache".to_string(), serde_json::Value::Bool(from_cache));
-        }
         if let Some(name) = obj.get("name").cloned() {
             obj.entry("frama_c_goal_name".to_string()).or_insert(name);
         }
@@ -1271,6 +1324,17 @@ pub fn host_load() -> HostLoad {
 pub struct RunMeasurement {
     pub goals: usize,
     pub replayed: usize,
+
+    /// Goals whose provenance the plug-in did not report.
+    ///
+    /// A third bucket rather than a rounding of the other two. from_cache is
+    /// three-valued, and reading it as "replayed or not" put every unknown in
+    /// the not-replayed half, which reads as "this run computed it" and is the
+    /// flattering direction. coverage.rs already counts it this way and says
+    /// so; this counter is the same reading for the same field, so replayed
+    /// plus this can be short of goals rather than one half absorbing the
+    /// doubt.
+    pub replayed_unknown: usize,
     pub unproved: usize,
     pub unproved_replayed: usize,
 
@@ -1308,6 +1372,7 @@ impl RunMeasurement {
         json!({
             "goals": self.goals,
             "replayed": self.replayed,
+            "replayed_unknown": self.replayed_unknown,
             "unproved": self.unproved,
             "unproved_replayed": self.unproved_replayed,
             "timed_out": self.timed_out,
@@ -1321,6 +1386,7 @@ pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
     let mut measured = RunMeasurement {
         goals: goals.len(),
         replayed: 0,
+        replayed_unknown: 0,
         unproved: 0,
         unproved_replayed: 0,
         timed_out: 0,
@@ -1338,8 +1404,10 @@ pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
         // count. own_status also covers a row straight off the wire, which
         // carries "status" alone.
         let timed_out = crate::mcp::status::own_status_is_timeout(goal);
-        let cached = goal_is_from_cache(goal);
+        let provenance = goal_is_from_cache(goal);
+        let cached = provenance == Some(true);
         measured.replayed += usize::from(cached);
+        measured.replayed_unknown += usize::from(provenance.is_none());
         measured.unproved += usize::from(unproved);
         measured.unproved_replayed += usize::from(unproved && cached);
         measured.timed_out += usize::from(timed_out);
@@ -1385,8 +1453,7 @@ pub fn wp_timeout_triage_none() -> serde_json::Value {
 /// prover_timeout_triage withdrew confidence for a replayed run while
 /// wp_timeout_triage_from_goal answered "high, a higher prover timeout may
 /// help" about the same goal.
-pub const REPLAYED_GOAL_REASON: &str =
-    "This goal's verdict came back from WP's cache rather than being attempted on this run, so \
+pub const REPLAYED_GOAL_REASON: &str = "This goal's verdict came back from WP's cache rather than being attempted on this run, so \
      nothing here measured it. WP's cache defaults to Update and stores timeout verdicts too. \
      Re-run with cache: \"None\" before treating it as a property of the goal.";
 
@@ -1398,8 +1465,7 @@ pub const REPLAYED_GOAL_REASON: &str =
 /// scopes really do differ: one goal's verdict was replayed, or every timed-out
 /// goal in the run was. Composing one from the other would save a sentence and
 /// cost the reader the difference.
-pub const REPLAYED_RUN_REASON: &str =
-    "Every timed-out goal in this run came back from WP's cache rather than being attempted, so \
+pub const REPLAYED_RUN_REASON: &str = "Every timed-out goal in this run came back from WP's cache rather than being attempted, so \
      this run measured nothing about them. WP's cache defaults to Update and stores timeout \
      verdicts too. Re-run with cache: \"None\" before drawing any conclusion.";
 
@@ -1419,26 +1485,35 @@ fn replayed_goal_triage(kind: &str) -> serde_json::Value {
 }
 
 pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Value {
-    let normalized_status = crate::mcp::status::consolidated_status(goal)
-        .unwrap_or("unknown");
-    let raw_status = crate::mcp::status::raw_status(goal)
-        .unwrap_or(normalized_status);
+    let normalized_status = crate::mcp::status::consolidated_status(goal).unwrap_or("unknown");
+    let raw_status = crate::mcp::status::raw_status(goal).unwrap_or(normalized_status);
     if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
-        if goal_is_from_cache(goal) {
-            return replayed_goal_triage("prover_timeout");
-        }
-        return wp_timeout_triage(
-            "prover_timeout",
-            true,
-            "high",
-            "The WP goal itself reports a prover timeout; a higher prover timeout may help.",
-            json!([
-                {"field": "normalized_status", "value": normalized_status},
-                {"field": "raw_status", "value": raw_status},
-            ]),
-        );
+        return match goal_is_from_cache(goal) {
+            Some(true) => replayed_goal_triage("prover_timeout"),
+            None => wp_timeout_triage(
+                "prover_timeout",
+                false,
+                "low",
+                "WP reports a prover timeout, but cache provenance is unavailable; refresh the goal before changing the timeout.",
+                json!([
+                    {"field": "from_cache", "value": serde_json::Value::Null},
+                    {"field": "normalized_status", "value": normalized_status},
+                    {"field": "raw_status", "value": raw_status},
+                ]),
+            ),
+            Some(false) => wp_timeout_triage(
+                "prover_timeout",
+                true,
+                "high",
+                "The WP goal itself reports a prover timeout; a higher prover timeout may help.",
+                json!([
+                    {"field": "normalized_status", "value": normalized_status},
+                    {"field": "raw_status", "value": raw_status},
+                ]),
+            ),
+        };
     }
     if matches!(normalized_status, "noresult" | "unknown")
         && matches!(
@@ -1470,7 +1545,7 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
     // rather than appended to the classification's, because the reason on a
     // classification is per goal by design and a constant repeated per goal
     // belongs in neither half of the split.
-    if goal_is_from_cache(goal) {
+    if goal_is_from_cache(goal) == Some(true) {
         return replayed_goal_triage("none");
     }
     wp_timeout_triage_none()
@@ -1503,9 +1578,7 @@ pub fn wp_timeout_triage_from_tasks_and_report(
         .map(|findings| {
             findings
                 .iter()
-                .filter(|f| {
-                    f.get("category").and_then(|c| c.as_str()) == Some("timeout")
-                })
+                .filter(|f| f.get("category").and_then(|c| c.as_str()) == Some("timeout"))
                 .collect()
         })
         .unwrap_or_default();
@@ -1809,7 +1882,10 @@ pub fn wp_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_j
 /// so the owned form allocated and freed twice per comparison for an ordering
 /// that never needed one.
 fn hypothesis_function_name(entry: &serde_json::Value) -> &str {
-    entry.get("function").and_then(|value| value.as_str()).unwrap_or_default()
+    entry
+        .get("function")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
 }
 
 /// Two readings of the same program's hypotheses, merged.
@@ -1847,7 +1923,9 @@ pub fn merge_memory_model_hypotheses(
         entries
             .iter()
             .filter_map(|entry| {
-                entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64)
+                entry
+                    .get("unparsed_warning_count")
+                    .and_then(serde_json::Value::as_u64)
             })
             .sum()
     };
@@ -1856,11 +1934,17 @@ pub fn merge_memory_model_hypotheses(
         |entry: &serde_json::Value| entry.get("function").is_some_and(|name| !name.is_null());
 
     let clauses = |entry: &serde_json::Value| -> u64 {
-        entry.get("hypothesis_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+        entry
+            .get("hypothesis_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
     };
     let mut merged: Vec<serde_json::Value> = into.into_iter().filter(named).collect();
     for entry in from.into_iter().filter(named) {
-        match merged.iter_mut().find(|kept| kept.get("function") == entry.get("function")) {
+        match merged
+            .iter_mut()
+            .find(|kept| kept.get("function") == entry.get("function"))
+        {
             Some(kept) if clauses(&entry) > clauses(kept) => *kept = entry,
             Some(_) => {}
             None => merged.push(entry),
@@ -1930,7 +2014,11 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         if !by_category && blocks.is_empty() {
             continue;
         }
-        let matched_by = if by_category { "log_category" } else { "message_text" };
+        let matched_by = if by_category {
+            "log_category"
+        } else {
+            "message_text"
+        };
 
         // A record matched on category alone whose wording this cannot parse is
         // counted rather than dropped, because dropping it would be the silence
@@ -1939,7 +2027,10 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         if blocks.is_empty() {
             unparsed += 1;
             if unparsed == 1 {
-                unparsed_source = message.get("source").cloned().unwrap_or_else(|| json!(null));
+                unparsed_source = message
+                    .get("source")
+                    .cloned()
+                    .unwrap_or_else(|| json!(null));
                 unparsed_matched_by = matched_by;
             }
             continue;
@@ -1967,9 +2058,8 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         }
     }
 
-    found.sort_by(|left, right| {
-        hypothesis_function_name(left).cmp(hypothesis_function_name(right))
-    });
+    found
+        .sort_by(|left, right| hypothesis_function_name(left).cmp(hypothesis_function_name(right)));
 
     if unparsed > 0 {
         found.push(json!({
@@ -2104,7 +2194,10 @@ fn hypothesis_clauses(block: &str) -> (Vec<String>, usize) {
     (clauses, total)
 }
 
-pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json::Value) -> &'static str {
+pub fn wp_failure_kind_from_tasks(
+    tasks: &serde_json::Value,
+    triage: &serde_json::Value,
+) -> &'static str {
     let triage_kind = triage
         .get("kind")
         .and_then(|value| value.as_str())
@@ -2164,9 +2257,7 @@ fn wp_tasks_contain_goal_with_status(
             let has_goal_id = object.contains_key("stable_goal_id")
                 || object.contains_key("goal_kind")
                 || object.contains_key("property_marker");
-            if has_goal_id
-                && crate::mcp::status::consolidated_status(value).is_some_and(accept)
-            {
+            if has_goal_id && crate::mcp::status::consolidated_status(value).is_some_and(accept) {
                 return true;
             }
             object

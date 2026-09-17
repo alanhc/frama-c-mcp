@@ -117,11 +117,11 @@ pub fn proof_receipt_goals(
                 // verdict was not computed by the run claiming it, so it cannot
                 // hash the same as one that was.
                 //
-                // Read through the accessor rather than off the key.
-                // enrich_goal_stable_id omits the field on a goal that had no
-                // summary to project, so a raw read defaults such a goal to
-                // "not cached", which is the direction that hides a replayed
-                // verdict, on the payload the receipt hashes.
+                // Read through the accessor rather than off the key, and
+                // three-valued: Option<bool>, so a goal the plug-in did not
+                // answer for hashes as null rather than as "not cached", which
+                // is the direction that hides a replayed verdict on the payload
+                // the receipt hashes.
                 "from_cache": json!(crate::mcp::server::wpclass::goal_is_from_cache(&goal)),
 
                 // Valid, but only because the hypotheses cannot hold, so the
@@ -165,11 +165,12 @@ pub fn proof_receipt_goals(
 /// Deliberately not named "is discharged", because it does not answer that in
 /// full. It catches valid_under_false_hypothesis, which is the shape a contract
 /// weakened to "requires \false" produces. It does not catch valid_under_hyp,
-/// where the property rests on something nothing established, nor valid_but_dead,
-/// where it holds because the code is unreachable. Both are the same family of
-/// overstatement arriving through Frama-C's other spellings, and closing them
-/// means widening goal_is_vacuously_proved, which the failure classifier also
-/// uses and where widening costs payload size that function's doc budgets for.
+/// where the property rests on something nothing established, nor
+/// valid_but_dead, where it holds because the code is unreachable. Both are
+/// the same family of overstatement arriving through Frama-C's other
+/// spellings, and closing them means widening goal_is_vacuously_proved, which
+/// the failure classifier also uses and where widening costs payload size that
+/// function's doc budgets for.
 ///
 /// The obvious-looking fix is wrong and has been reached for twice, so it is
 /// written down here. check_goal_counts_as_progress reads the consolidated

@@ -2,6 +2,54 @@
 
 Use this as the shortest reliable MCP call order for common Frama-C verification work. Tool arguments are shown only where the branch depends on them.
 
+## Definition of Done
+
+The stopping conditions below say when a loop has nothing left to do. This is
+what has to hold before a function is called verified, in a report or in a
+`store_function_conclusion` status, and a green goal count is not it. The list
+adapts the one in acsl-skills (`acsl-verify/SKILL.md`, "Done").
+
+1. **Every goal is valid with runtime-error obligations generated.** The project
+   was loaded with `rte: true`, or `run_wp` named the function under
+   `rte_guarded_in_place`. Without either there is no overflow, validity or
+   division goal to fail, and `check` reports `RTE_DISABLED`.
+2. **`check {function}` leaves `incomplete[]` empty.** A goal that is valid
+   under `VALID_UNDER_HYP`, `ASSUMED_CALLEE_CONTRACT` or
+   `WP_MEMORY_MODEL_HYPOTHESIS` is valid under something nobody proved.
+3. **A smoke run finds no vacuity.** A contract that cannot be satisfied
+   proves every goal. Measured on Frama-C 33: `requires n > 0 && n < 0;` on a
+   function returning 0 proves `ensures \result == 42`, 4 of 4. Smoke tests
+   are off by default, so ask for them:
+
+   ```text
+   check {files, smoke: true}
+   ```
+
+   A smoke goal WP proves comes back as `SMOKE_TEST_FAILED`, naming the goal
+   (`..._wp_smoke_default_requires` on that file), and one that could not run
+   as `SMOKE_TEST_UNCHECKED`. The smoke probe is a separate Frama-C over the
+   AST this session holds, printed out, so injected annotations are part of
+   what it tests; its result is under `wp.smoke_probe`. `run_wp {functions,
+   smoke: true}` runs the same probe beside a proof. Adding `provers` instead
+   selects the isolated command-line route, which proves the files on disk and
+   reports each attempt's smoke counts under `wp_attempts[].smoke`.
+4. **Every function carries `assigns`**, declared-only callees included, since
+   Frama-C's generated contract for a bare prototype never lists a global (see
+   [writing-acsl.md](writing-acsl.md#callee-contracts)). Write `terminates` and
+   `exits` where their defaults are wrong: Frama-C 33 supplies
+   `terminates \true` and `exits \false` to a function that states neither, so
+   a function that may loop forever or call `exit` needs its own.
+
+Report per function. When part of a file does not prove, name the functions and
+the reason, and store a status other than `verified` for them, rather than
+describing the file by the part that did.
+
+A goal count that falls after you remove a false lemma or a false invariant is
+the correct outcome, not a regression. WP offers every lemma in scope as a
+hypothesis whether or not it was discharged, so the goals that closed on a
+false one were resting on it (acsl-skills `frama-c-wp/references/limitations.md`,
+B-18). Say what was false and how many goals went with it.
+
 ## Direct EVA/WP Loop
 
 One-call entry:
@@ -16,7 +64,7 @@ entries that need attention. Read `incomplete[]` for the findings and
 `counts` for the shape; call again with `detail: "full"` only when you need
 every goal.
 
-Each `incomplete[]` entry carries a `code`; the thirteen are tabulated in
+Each `incomplete[]` entry carries a `code`, and the codes are tabulated in
 [README.md](../README.md). The set is additive, so treat a code you do not
 recognise as a gap rather than as noise.
 
@@ -102,7 +150,7 @@ source position. When you are starting from an alarm instead,
 with the property, its callers and its annotations, and takes a property
 marker rather than a statement one.
 
-Stopping condition: `get_wp_goals {want: ["alarms"]}` has no relevant invalid/unknown alarms for the target function, and its goal list for that function has no non-valid goals.
+Stopping condition: `get_wp_goals {want: ["alarms"]}` has no relevant invalid/unknown alarms for the target function, and its goal list for that function has no non-valid goals. Check the [definition of done](#definition-of-done) before calling it verified.
 
 Common failure branch: if dry-run reports failures, fix the proposed ACSL before injection. If WP remains non-valid, call `get_wp_goals {want: ["vc"], function}` and revise the annotation rather than reloading the project.
 
@@ -120,7 +168,15 @@ hash is an error rather than an empty diff, so a reload or a restart means
 starting from a fresh baseline instead of silently reporting no change.
 
 Record the verdict with `store_function_conclusion` rather than in a file of
-your own. A `verified` status needs a `proof_receipt` as evidence, and the
+your own. A `verified` status needs the `proof_receipt` of a **`check` whose
+`incomplete[]` came back empty**: the soundness gates run in `check`, and a
+`run_wp` receipt records no verdict, so an invented callee contract, a skipped
+function or annotation, an unsound encoding and a failed smoke test are all
+invisible to it. Storing one is refused. That is Definition of Done condition 2
+enforced rather than only written down; before it was, `run_wp` on
+`generated-callee-spec.c` proved 7 of 7, stored as verified, and
+`proof_coverage` answered "complete" at 100% for a program whose proof rests on
+a contract nobody wrote. The
 server checks the receipt's bytes against the hash it wrote, so echoing the
 object back through your own context is both large and fragile: one function's
 receipt runs to kilobytes, most of it a goal array, and a single altered field
@@ -188,6 +244,53 @@ anything, so every caller loses what it knew across the call, and no
 postcondition about the callee survives. See
 [writing-acsl.md](writing-acsl.md) for what to write once the frames are in.
 
+## Retrofitting Existing Code
+
+For an unannotated codebase where the aim is verified functions rather than one
+proof. The order is the part that matters, and the mistake it prevents is
+starting with functional postconditions. It follows acsl-skills
+(`verifiable-c/references/hostile-c.md`, "Legacy code you cannot restructure").
+
+Call order:
+
+```text
+reload_project {files, rte: true}
+check {function}
+get_wp_goals {function, status: "unproved"}
+context {want: ["rte_obligations"], function}
+propose_annotations {function}
+inject_all_annotations {function, dry_run: true, annotations: proposals}
+inject_all_annotations {function, annotations: proposals}
+create_sandbox {function} -> inject the drafted requires there -> run_wp
+verify_program_step {lock_project?}
+```
+
+1. **Run with RTE and no contracts first.** The goals left open are the
+   runtime-error risk list: each one's `predicate` names a memory access or an
+   arithmetic bound the code does not yet justify. That list is worth having
+   before any contract exists, and it is the work list for the next two steps.
+   Read it for which checks exist, not for how many timed out; see
+   [Unproved is not the same as unspecified](#unproved-is-not-the-same-as-unspecified).
+2. **Frames, then only the `requires` that discharge those goals.**
+   `propose_annotations` gives the `assigns` the code determines, and
+   `assigns` cannot be skipped even here, because every caller depends on it.
+   `context {want: ["rte_obligations"]}` drafts a `requires` per check. Main
+   refuses a `requires`, so try it in a sandbox, and once it closes the goals
+   write it into the source and reload: that is the edit a reviewer sees.
+3. **Functional `ensures` last, innermost callees first.** A caller cannot be
+   proved before its callees have contracts, which is the order
+   `verify_program_step` hands functions out in; continue with the
+   [Whole-Program Bottom-Up Loop](#whole-program-bottom-up-loop).
+
+Two things stop this from being mechanical. A function built around a
+construct WP cannot follow will not prove whatever is written about it: say so
+and move it to the shell, per
+[Code WP cannot prove as written](#code-wp-cannot-prove-as-written), rather
+than leaving a contract that looks like progress. And for a data structure the
+minimal contract can collapse into the full one, because the runtime checks
+depend on the structure's invariant (acsl-skills, same file); that is a signal
+the data shape needs to change, not that the contract needs more work.
+
 ## Contract-First Loop
 
 For work on a function that already has a contract, where the job is to make
@@ -227,8 +330,9 @@ where to try them, since a wrong loop invariant that makes WP diverge costs a
 respawn rather than the session.
 
 Stopping condition: `check {function}` reports `verdict: "proved"` with an
-empty `incomplete[]`, and no `requires` or `ensures` differs from what the run
-started with.
+empty `incomplete[]`, no `requires` or `ensures` differs from what the run
+started with, and the rest of the [definition of done](#definition-of-done)
+holds.
 
 Common failure branch: a goal that stays unproved with no plausible missing
 invariant usually means the contract cannot be met as written, not that the
@@ -379,7 +483,7 @@ Resume after an interruption by calling `verify_program_step`, then `list {kind:
 
 If `verify_program_step` returns more ready functions, stay locked and repeat from `create_sandbox` through the next `verify_program_step` before unlocking with `verify_program_step {lock_project: false}`. The completed set must contain only functions whose verified structured annotations have already been merged into the main project.
 
-Stopping condition: every defined function has a stored conclusion, `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals. "No remaining work" arrives as `next_action.tool: null`, which is the stop signal. The same null tool also means the response could not be held to its byte budget, so read `blockers` before concluding you are done: `[]` with `next_action.status: "done"` is the finished run, while `oversized_function_name` or `payload_budget` means the answer did not fit and calling again returns the same thing.
+Stopping condition: every defined function has a stored conclusion, every `verified` one meets the [definition of done](#definition-of-done), `verify_program_step` returns no remaining work, and the final `run_wp` over the main project has no non-valid goals. "No remaining work" arrives as `next_action.tool: null`, which is the stop signal. The same null tool also means the response could not be held to its byte budget, so read `blockers` before concluding you are done: `[]` with `next_action.status: "done"` is the finished run, while `oversized_function_name` or `payload_budget` means the answer did not fit and calling again returns the same thing.
 
 Common failure branch: if no function is ready, inspect the `verification_order` and `scc_groups` returned by `verify_program_step` plus current `list {kind: "conclusions"}` output. If `reload_project` or `run_wp` is rejected while locked, finish sandbox work first or call `verify_program_step {lock_project: false}` only for the final main-project gate.
 
@@ -506,13 +610,59 @@ Try the strengthening in a sandbox, not in the file. `create_sandbox
 than an edit to revert, and the sandbox's goals can be diffed against the main
 project's. Copying the source tree by hand gets none of that.
 
+### Isolating one goal
+
+Triage is faster against one goal than against a function's worth, and that
+starts with the goal having a name you can match. Name the clauses you write,
+`loop invariant bound:`, `ensures sorted:`, and reuse the same few names across
+a project. An injected clause is named for you: measured, `assert r == 0`
+injected on main came back with `hash_label: "an_5733ce62"` and
+`user_label: "Assert0"`, and its goal was
+`typed_nocast_answer_assert_an_5733ce62_Assert0`. A name written inside the
+ACSL itself survives as a suffix, so `named_by_hand: r == 0` became
+`..._Assert2_named_by_hand`. Match on that name in
+`get_wp_goals {function, status: "unproved"}` and read that goal's `predicate`
+and sequent instead of the whole list.
+
+`run_wp {prop}` narrows the run to the properties it selects: a comma-separated
+list of property names or `@kind` categories, each optionally prefixed with `+`
+to select or `-` to exclude, so `two`, `-one`, `@assert` and `@assert,-one` all
+work. The server resolves the selection against the target functions'
+properties and proves exactly those, and a filter that selects nothing is
+refused with the names and kinds that were available. That refusal is why
+`@ensures,-pos` is not an example here: `pos` is the only postcondition of the
+fixture below, so the exclusion empties the selection and the call is rejected.
+Measured on `tests/fixtures/prop-named-asserts.c`: the run's receipt holds 7
+goals without `prop`, 1 with `prop: "two"`, 4 with `prop: "-one"`, 3 with
+`prop: "@assert"`, and 2 with `prop: "@assert,-one"`. It used to generate and
+report every goal of the function whatever `prop` said, on every path but the
+isolated one. `get_wp_goals` still lists every goal WP generated this session,
+so read a narrowed run off its own receipt. A run restricted by `prop` is not
+evidence for a stored conclusion: `proof_coverage` reports it as
+`proved_under_a_goal_filter`.
+
+`check {prop}` narrows the same way and can never report `proved`: it carries
+`CHECK_NARROWED_BY_PROP` in `incomplete[]` for as long as the filter is set.
+The reason is worth knowing, because the alternative looks safe and is not. WP
+generates goals only for the selected properties, so a property the filter
+excluded produces no goal and therefore no `GOAL_NOT_VALID` entry; there is no
+absence for anything downstream to notice. Measured on
+`tests/fixtures/check-prop-narrowed.c`, whose `hard` assert does not discharge:
+without `prop` the check is `incomplete`, and with `prop: "easy"` it came back
+`proved` having proved nothing at all. Use `check {prop}` to iterate on one
+property, and run `check` without it before believing anything about the
+function as a whole.
+
 ### Unproved is not the same as unspecified
 
-Running WP over a file that carries no ACSL answers a question nobody asked.
-Every RTE obligation it generates is stated against an empty contract, so the
-prover has nothing to reason from and the goals come back `timeout` or
+Running WP over a file that carries no ACSL does not ask whether the code is
+correct. Every RTE obligation it generates is stated against an empty contract,
+so the prover has nothing to reason from and the goals come back `timeout` or
 `unknown` in bulk. That is not a proof attempt that fell short; it is a file
-with no specification.
+with no specification. What the run is good for is the list of obligations
+itself, which is where [Retrofitting Existing Code](#retrofitting-existing-code)
+starts: read each open goal for the check it names, never its status as a
+verdict.
 
 Read the report's `assumed_callee_contract` findings first. They name callees
 with no `assigns` clause, and they explain the timeouts underneath them:
@@ -539,9 +689,11 @@ static struct entry *_Atomic head;     /* expands to struct entry *head */
 ```
 
 The first leaves a parenthesized type where a declarator belongs, so Frama-C
-reports a syntax error at the `*` with no mention of atomics. Both spellings
-mean the same object in C11. Prefer the qualifier form in any file an analyzer
-has to read.
+reports `syntax error` "before or at token: struct", inside the parentheses the
+expansion left behind, with no mention of atomics. Measured on Frama-C 33 both
+with a bare `#define _Atomic` and with Frama-C's own `<stdatomic.h>` included;
+the second spelling parses under either. Both spellings mean the same object in
+C11. Prefer the qualifier form in any file an analyzer has to read.
 
 ### A file that never parsed, and the unit of verification
 
@@ -591,3 +743,36 @@ strictly weaker than `\valid(p)`, and `assert(a != b)` misses overlapping
 pointers into one object, so a pointer clause is reviewed by eye and only the
 scalar ones become checks. Say which clauses are covered rather than implying
 all of them are.
+
+### Code WP cannot prove as written
+
+Some C parses and still cannot be proved in the shape it has. The answer is the
+split above applied to constructs instead of headers: a verified core that
+computes over memory the caller supplies, an unverified shell holding what WP
+cannot follow, and a contract on the boundary between them (acsl-skills
+`verifiable-c/SKILL.md`). The constructs that belong in the shell, with
+acsl-skills' measurements (`verifiable-c/references/hostile-c.md`) and two
+re-measured here on Frama-C 33:
+
+- **A `goto` back-edge.** WP refuses the whole function with "Non-natural loop
+  detected in function 'count'. This case is not supported yet (skipped
+  verification)." Measured here, the same run still printed
+  `Proved goals: 2 / 2` before Frama-C exited 1, so a count from it is about
+  nothing. Rewrite the loop as `while` or `for`; a forward `goto` to one
+  cleanup label is fine.
+- **Union field access.** WP warns "Accessing union fields with
+  Typed model might be unsound." and proves anyway: measured here, 5 of 5 with
+  the warning printed three times. Use a tagged struct in the core.
+- **Byte punning**, a `(char *)` over an `int *`. It times out under `Typed`,
+  `Typed+cast`, `Typed+nocast` and `Bytes` alike, and the cast degrades
+  `assigns` to everything.
+- **`malloc` and `free`.** Under the Frama-C 33 Typed-model configuration used
+  for this measurement, WP did not model this allocation path. The core takes
+  a caller-supplied buffer and its length; projects using WP's dynamic-allocation
+  model should validate their configured allocator contracts separately.
+- **`container_of`.** The round trip through the cast times out. Hand the core
+  the typed pointer and keep the one cast in the shell.
+
+The shell stays unverified, and the report says so by function. Closing that
+gap is the same runtime-check move as for the header split above, and it is
+partial for the same reasons.

@@ -48,6 +48,9 @@ enum Command {
         /// Optional function focus.
         #[arg(long)]
         function: Option<String>,
+        /// Also run WP smoke tests and report any smoke goal WP proves.
+        #[arg(long)]
+        smoke: bool,
         /// Response size: "summary" (default) or "full".
         #[arg(long, value_enum)]
         detail: Option<frama_c_mcp::mcp::types::Detail>,
@@ -97,6 +100,7 @@ async fn async_main() -> anyhow::Result<()> {
         json: _,
         require_complete,
         function,
+        smoke,
         detail,
         include_paths,
         defines,
@@ -109,6 +113,7 @@ async fn async_main() -> anyhow::Result<()> {
             CheckParams {
                 files: Some(vec![file]),
                 function,
+                smoke: smoke.then_some(true),
                 detail,
                 include_paths: Some(include_paths),
                 defines: Some(defines),

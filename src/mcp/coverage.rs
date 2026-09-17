@@ -550,14 +550,16 @@ pub fn proof_coverage_report(
             // and it has no business being the lax one. by_status above stays a
             // status histogram, because that is what it says it is.
             if receipt_goal_is_progress(goal) {
-                // Through the accessor, which falls back to the summary where
-                // the lifted field is absent. Reading the key alone called such
-                // a goal freshly proved, which is the flattering direction for
-                // a coverage number.
+                // Through the accessor, and three-valued: a goal whose
+                // provenance the plug-in did not report counts as neither
+                // replayed nor fresh, so the two halves can be short of
+                // valid_goals rather than one of them absorbing the doubt.
+                // Reading the key alone called such a goal freshly proved,
+                // which is the flattering direction for a coverage number.
                 let replayed = crate::mcp::server::wpclass::goal_is_from_cache(goal);
                 valid_goals += 1;
-                cached_valid_goals += usize::from(replayed);
-                fresh_valid_goals += usize::from(!replayed);
+                cached_valid_goals += usize::from(replayed == Some(true));
+                fresh_valid_goals += usize::from(replayed == Some(false));
             }
         }
     }

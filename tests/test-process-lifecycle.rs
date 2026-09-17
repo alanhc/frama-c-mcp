@@ -1789,11 +1789,81 @@ fn self_check_reports_missing_frama_c_over_stdio() {
     let payload: serde_json::Value = serde_json::from_str(text).expect("self_check JSON");
     assert_eq!(payload["frama_c"]["status"], "missing");
     assert_eq!(payload["socket_spawn"]["status"], "missing");
+
+    // Where a working frama-c is, when the configured one is not. A list either
+    // way, empty on a machine without opam, and a hint that names the path that
+    // failed.
+    let candidates = &payload["frama_c_candidates"];
+    assert!(candidates["opam_switches"].is_array(), "{candidates:?}");
+    assert!(
+        candidates["hint"].as_str().is_some_and(|hint| hint.contains("__frama_c_mcp_missing_binary__")),
+        "{candidates:?}"
+    );
     assert!(payload["required_requests"]
         .as_array()
         .expect("required_requests")
         .iter()
         .all(|r| r["status"] == "not_probed"));
+}
+
+#[test]
+fn self_check_finds_opam_switches_without_waiting_out_the_budget() {
+    // A fake opam with three switches, two of which hold an executable frama-c.
+    // It answers at once, so discovery has nothing to wait for.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin_for = |switch: &str| {
+        let bin = dir.path().join(switch);
+        std::fs::create_dir_all(&bin).unwrap();
+        let frama_c = bin.join("frama-c");
+        std::fs::write(&frama_c, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&frama_c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        bin
+    };
+    let (b, c) = (bin_for("b"), bin_for("c"));
+    let fake = dir.path().join("path");
+    std::fs::create_dir_all(&fake).unwrap();
+    let opam = fake.join("opam");
+    std::fs::write(
+        &opam,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n'switch list --short') printf 'a\\nb\\nc\\n' ;;\n\
+             'var --switch=b bin') echo {} ;;\n'var --switch=c bin') echo {} ;;\n\
+             *) echo /nonexistent ;;\nesac\n",
+            b.display(),
+            c.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&opam, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut mcp = McpHandle::spawn_test_binary_with_frama_c_and_path(
+        "__frama_c_mcp_missing_binary__",
+        fake.as_os_str(),
+    );
+    let started = std::time::Instant::now();
+    let payload = tool_payload(&mcp.call_tool("self_check", "{}"));
+    let elapsed = started.elapsed();
+
+    let switches = payload["frama_c_candidates"]["opam_switches"]
+        .as_array()
+        .expect("opam_switches")
+        .iter()
+        .map(|entry| entry["switch"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(switches, ["b", "c"], "{payload:?}");
+    assert!(
+        payload["frama_c_candidates"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("--switch=b")),
+        "{payload:?}"
+    );
+
+    // The discovery deadline is the five-second tool probe budget. A loop that
+    // waits for it after the last probe has answered takes all of it.
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "self_check took {elapsed:?} with every probe answering at once"
+    );
 }
 
 #[test]
@@ -1849,7 +1919,7 @@ fn self_check_reports_capabilities_over_stdio() {
     // (self_check_shape_with_missing_frama_c and its capabilities twin).
     // Removing a plug-in request means changing all three; missing one costs a
     // full gate run to find, which is how this comment came to exist.
-    assert_eq!(capabilities["ast_utils"]["registered_request_count"], 29);
+    assert_eq!(capabilities["ast_utils"]["registered_request_count"], 30);
     for request in [
         "plugins.ast-utils.getCilContext",
         "plugins.ast-utils.getContractContext",

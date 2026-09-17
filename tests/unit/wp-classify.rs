@@ -30,6 +30,7 @@ fn wp_response(run: WpRun<'_>) -> serde_json::Value {
         functions: vec![],
         scope: "main",
         rte_enabled: false,
+        unsigned_rte: true,
         frama_c_protocol: vec![],
         proofread_report: run.report,
         goals: run.goals,
@@ -162,8 +163,9 @@ fn classify_wp_failure_timeout() {
     assert_eq!(classification["wp_timeout_triage"]["kind"], "prover_timeout");
     assert_eq!(
         classification["wp_timeout_triage"]["retry_with_higher_prover_timeout"],
-        true
+        false
     );
+    assert_eq!(classification["wp_timeout_triage"]["confidence"], "low");
 }
 
 #[test]
@@ -2448,6 +2450,36 @@ fn only_a_run_whose_timeouts_were_all_replayed_withdraws_the_verdict() {
 // The predicate is handed the whole fetchGoals table, which carries goals from
 // functions proved earlier in the session and goals left at NORESULT by
 // -wp-prop. Those are unproved and not cached, so scoping the question to every
+/// A goal whose provenance the plug-in did not report is counted as neither
+/// replayed nor fresh.
+///
+/// from_cache is three-valued, and reading it as "replayed or not" put every
+/// unknown into the not-replayed half, which a caller reads as "this run
+/// computed it". That is the flattering direction, and it is the reading
+/// coverage.rs was already fixed not to take. replayed plus replayed_unknown
+/// may be short of goals; neither half absorbs the doubt.
+#[test]
+fn a_goal_with_no_reported_provenance_is_neither_replayed_nor_fresh() {
+    let goals = vec![
+        json!({"stable_goal_id": "replayed", "status": "valid", "from_cache": true}),
+        json!({"stable_goal_id": "fresh", "status": "valid", "from_cache": false}),
+        json!({"stable_goal_id": "unanswered", "status": "valid", "from_cache": null}),
+
+        // No key at all, which is what a goal that never passed through
+        // apply_cache_provenance carries.
+        json!({"stable_goal_id": "unenriched", "status": "valid"}),
+    ];
+    let m = run_measurement(&goals);
+
+    assert_eq!(m.goals, 4);
+    assert_eq!(m.replayed, 1, "an unknown was counted as replayed");
+    assert_eq!(m.replayed_unknown, 2, "an unknown was counted as freshly proved");
+    assert!(
+        m.replayed + m.replayed_unknown < m.goals,
+        "the two halves absorbed the doubt instead of leaving it visible"
+    );
+}
+
 // unproved goal let a single one of them keep the verdict confident while every
 // timed-out goal in the run had in fact been replayed.
 #[test]
@@ -3130,7 +3162,7 @@ async fn a_probe_whose_frama_c_fails_is_not_a_clean_probe() {
         "false",
         &["a.c".to_string()],
         &options,
-        false,
+        true,
         Some("Typed+nocast"),
         &[],
         None,
@@ -3181,6 +3213,140 @@ async fn a_probe_with_no_files_does_not_run() {
     assert_eq!(probe["reason"], json!("no source files available"), "{probe:?}");
 }
 
+/// The smoke process must use the same narrowed property set as its proof.
+///
+/// A successful stand-in makes the probe return its command, so this pins the
+/// actual argument forwarded to Frama-C rather than a duplicate configuration
+/// object that the command builder might ignore.
+///
+/// It asserted the opposite until 2026-09-17: that the probe forwards the
+/// proof run's -wp-prop, so that the two describe the same property set. That
+/// cannot be done. Smoke goals are synthetic and carry no property name, so
+/// every filter form removes all of them, measured on Frama-C 33 against a
+/// contradictory precondition: no filter reports "Smoke Tests: 0 / 1", while a
+/// named property, an "@ensures" category and "@smoke" each print no smoke
+/// line at all. Forwarding the filter did not narrow the probe, it disabled
+/// it, and the run it was narrowing to is the one whose proof the vacuity
+/// would invalidate. The -wp-fct list is the scoping that survives.
+#[tokio::test]
+async fn a_smoke_probe_does_not_forward_the_property_filter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = write_executable(dir.path(), "#!/bin/sh\nexit 0\n");
+    let options = frama_c_mcp::mcp::server::ProjectLoadOptions {
+        rte: true,
+        ..Default::default()
+    };
+    let probe = frama_c_mcp::mcp::server::wpcli::run_wp_smoke_probe(
+        &fake,
+        frama_c_mcp::mcp::server::wpcli::SmokeProbeRequest {
+            files: &["a.c".to_string()],
+            project_options: &options,
+            rte: true,
+            model: None,
+            functions: &["target".to_string()],
+            run: &json!({}),
+        },
+    )
+    .await;
+
+    assert_eq!(probe["ran"], json!(true), "{probe:?}");
+    assert!(
+        probe["command"]
+            .as_array()
+            .is_some_and(|args| args.iter().all(|arg| arg != "-wp-prop")),
+        "the probe forwarded a property filter, which removes every smoke goal: {probe:?}"
+    );
+
+    // The scoping that does survive, so this is not asserting the absence of
+    // narrowing altogether.
+    assert!(
+        probe["command"]
+            .as_array()
+            .is_some_and(|args| args.windows(2).any(|pair| pair == ["-wp-fct", "target"])),
+        "the probe lost its function scoping: {probe:?}"
+    );
+    for flag in ["-warn-unsigned-overflow", "-warn-unsigned-downcast"] {
+        assert!(
+            probe["command"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == flag)),
+            "{flag} is absent: {probe:?}"
+        );
+    }
+}
+
+/// An isolated retry that adds RTE to a load without it probes smoke tests
+/// under the same unsigned checks its proof attempts ran.
+///
+/// The attempts take their guard set from the retry's own RTE setting, since
+/// the retry can add guards the load did not have. The smoke probe read the
+/// load's rte bit instead, so on an rte false load it dropped the unsigned
+/// options the attempts beside it passed. The stand-in succeeds only when
+/// both switches reach its argv, for the attempt and the probe alike.
+#[tokio::test]
+async fn an_isolated_retry_smoke_probe_matches_its_attempts_unsigned_checks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = write_executable(
+        dir.path(),
+        "#!/bin/sh\noverflow=false\ndowncast=false\nfor arg in \"$@\"; do\n  [ \"$arg\" = -warn-unsigned-overflow ] && overflow=true\n  [ \"$arg\" = -warn-unsigned-downcast ] && downcast=true\ndone\n$overflow && $downcast\n",
+    );
+    let server = lazy_server(fake);
+    let params = RunWpParams {
+        smoke: Some(true),
+        ..Default::default()
+    };
+    let result = server
+        .run_isolated_wp_retries(frama_c_mcp::mcp::server::wpcli::IsolatedWpRetry {
+            files: vec!["a.c".to_string()],
+            project_options: frama_c_mcp::mcp::server::ProjectLoadOptions::default(),
+            rte_enabled: true,
+            functions: vec!["target".to_string()],
+            reported_functions: vec!["target".to_string()],
+            provers: vec!["alt-ergo".to_string()],
+            params: &params,
+            scope: "project",
+        })
+        .await
+        .expect("the retry path answers with a payload");
+    let response = result.structured_content.expect("retry payload");
+    assert_eq!(response["wp_attempts"][0]["success"], json!(true), "{response:?}");
+    assert_eq!(response["smoke_probe"]["ran"], json!(true), "{response:?}");
+}
+
+/// An RTE-enabled isolated retry carries the sandbox's unsigned RTE checks.
+///
+/// The stand-in accepts only when both kernel switches reached its argv. This
+/// is the retry configuration sandboxes use when plural provers select the
+/// isolated CLI route.
+#[tokio::test]
+async fn an_rte_isolated_retry_keeps_unsigned_rte_checks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = write_executable(
+        dir.path(),
+        "#!/bin/sh\noverflow=false\ndowncast=false\nfor arg in \"$@\"; do\n  [ \"$arg\" = -warn-unsigned-overflow ] && overflow=true\n  [ \"$arg\" = -warn-unsigned-downcast ] && downcast=true\ndone\n$overflow && $downcast\n",
+    );
+    let server = lazy_server(fake);
+    let params = RunWpParams::default();
+    let result = server
+        .run_isolated_wp_retries(frama_c_mcp::mcp::server::wpcli::IsolatedWpRetry {
+            files: vec!["a.c".to_string()],
+            project_options: frama_c_mcp::mcp::server::ProjectLoadOptions {
+                rte: true,
+                ..Default::default()
+            },
+            rte_enabled: true,
+            functions: vec!["target".to_string()],
+            reported_functions: vec!["target".to_string()],
+            provers: vec!["alt-ergo".to_string()],
+            params: &params,
+            scope: "sandbox",
+        })
+        .await
+        .expect("the retry path answers with a payload");
+    let response = result.structured_content.expect("retry payload");
+    assert_eq!(response["wp_attempts"][0]["success"], json!(true), "{response:?}");
+}
+
 /// A stand-in frama-c whose behaviour depends on which prover it was given.
 ///
 /// The isolated retry runs one process per prover and reads the hypotheses out
@@ -3210,6 +3376,25 @@ fn write_executable(dir: &std::path::Path, script: &str) -> String {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Wait until the script can be executed. The unit tests run on many
+        // threads, and a fork on another thread while this one held the file
+        // open for writing leaves that child with the write descriptor until it
+        // execs, so exec here fails with ETXTBSY ("Text file busy") for a
+        // moment. That failed the probe test
+        // a_failed_probe_keeps_the_hypotheses_it_managed_to_read twice in
+        // full-suite runs, with the probe reporting it could not start the fake
+        // frama-c at all. Every script written here only prints and exits, so
+        // running it once is harmless.
+        const TEXT_FILE_BUSY: i32 = 26;
+        for _ in 0..200 {
+            match std::process::Command::new(&path).output() {
+                Err(error) if error.raw_os_error() == Some(TEXT_FILE_BUSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
     }
     path.display().to_string()
 }
@@ -3486,4 +3671,63 @@ fn the_longer_reading_of_a_function_wins_over_the_first() {
             "a clause WP printed was dropped: {merged:?}"
         );
     }
+}
+
+/// The analyzer's own output becomes messages the gates can classify.
+///
+/// The isolated CLI route never touches the socket, so the drain check reads
+/// is empty for it and the four message-derived gates saw nothing. Frama-C 33
+/// wraps a warning onto indented continuation lines, which is the form the
+/// interesting ones take, so a parser reading only the header line would find
+/// every message empty.
+#[test]
+fn cli_output_becomes_messages_the_gates_can_read() {
+    use frama_c_mcp::mcp::server::wpcli::parse_cli_messages;
+
+    let text = "\
+[kernel] Parsing f.c (with preprocessing)
+[kernel:annot:missing-spec] f.c:14: Warning: 
+  Neither code nor specification for function unspecified, generating default
+  exits, assigns and terminates. See -generated-spec-* options for more info.
+[wp] Warning: Missing RTE guards
+[wp:union] f.c:18: Warning: 
+  Accessing union fields with Typed model might be unsound.
+[wp] Proved goals:    7 / 7
+";
+    let messages = parse_cli_messages(text);
+
+    // The kernel message the GENERATED_CALLEE_SPEC gate keys on, carrying the
+    // category that gate matches and the wrapped body.
+    let generated = messages
+        .iter()
+        .find(|m| m["category"] == "annot:missing-spec")
+        .expect("the missing-spec message was not parsed");
+    assert_eq!(generated["plugin"], "kernel");
+    assert_eq!(generated["kind"], "WARNING");
+    assert!(
+        generated["message"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Neither code nor specification for function")),
+        "the wrapped body was lost: {generated:?}"
+    );
+    assert_eq!(generated["source"]["line"], 14);
+
+    // The union warning the WP_UNSOUND_ENCODING gate keys on.
+    assert!(
+        messages.iter().any(|m| {
+            m["plugin"] == "wp"
+                && m["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("might be unsound"))
+        }),
+        "the union warning was not parsed: {messages:?}"
+    );
+
+    // A one-line warning keeps its text, and the non-warning lines are not
+    // mistaken for messages.
+    assert!(messages.iter().any(|m| m["message"] == "Missing RTE guards"));
+    assert!(
+        messages.iter().all(|m| m["message"] != "Parsing f.c (with preprocessing)"),
+        "a plain progress line was read as a message: {messages:?}"
+    );
 }

@@ -29,7 +29,7 @@ pub fn parse_proved_goals(output: &str) -> (Option<u64>, Option<u64>) {
         .unwrap_or((None, None))
 }
 
-pub fn e_acsl_runtime_boundaries() -> serde_json::Value {
+pub(crate) fn e_acsl_runtime_boundaries() -> serde_json::Value {
     json!({
         "coverage_warning": runtime_check_coverage_warning(),
         "assigns_clauses": "E-ACSL does not prove assigns clauses; use WP for frame conditions.",
@@ -38,7 +38,7 @@ pub fn e_acsl_runtime_boundaries() -> serde_json::Value {
     })
 }
 
-pub fn parse_e_acsl_violation(output: &str) -> serde_json::Value {
+pub(crate) fn parse_e_acsl_violation(output: &str) -> serde_json::Value {
     // Once, like the others. Cold compared to the acsl.rs pair, kept the same
     // way so there is one shape to recognise rather than two.
     static LOCATION_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -176,14 +176,14 @@ pub fn collect_why3_dump_files(
     (kept, omitted)
 }
 
-pub fn why3_dump_file_name(file_name: &str) -> bool {
+pub(crate) fn why3_dump_file_name(file_name: &str) -> bool {
     let Some(extension) = file_name.rsplit('.').next() else {
         return false;
     };
     file_name.contains("_Why3_") && matches!(extension, "why" | "psmt2" | "smt2")
 }
 
-pub fn why3_dump_goal_id(file_name: &str) -> String {
+pub(crate) fn why3_dump_goal_id(file_name: &str) -> String {
     let prefix = file_name.split("_Why3_").next().unwrap_or("");
     if prefix.starts_with("typed_") {
         prefix.to_string()
@@ -287,7 +287,7 @@ pub fn wp_output_warnings(stdout: &str, stderr: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn wp_print_block_json((function, title, body): (String, String, Vec<String>)) -> serde_json::Value {
+pub(crate) fn wp_print_block_json((function, title, body): (String, String, Vec<String>)) -> serde_json::Value {
     let kind = wp_print_kind(&title);
     let mut hypotheses = Vec::new();
     let mut conclusion = Vec::new();
@@ -322,7 +322,7 @@ pub fn wp_print_block_json((function, title, body): (String, String, Vec<String>
     })
 }
 
-pub fn wp_print_kind(title: &str) -> &'static str {
+pub(crate) fn wp_print_kind(title: &str) -> &'static str {
     let text = title.to_ascii_lowercase();
     if text.contains("pre-condition") {
         "requires"
@@ -349,7 +349,7 @@ pub fn wp_print_kind(title: &str) -> &'static str {
     }
 }
 
-pub fn wp_print_match_line(title: &str) -> Option<u64> {
+pub(crate) fn wp_print_match_line(title: &str) -> Option<u64> {
     // Each pass consumes what it matched, and the second starts where the first
     // stopped rather than at the title again, so a "lines" run ahead of the
     // last "line" is not picked up a second time as the later match.
@@ -373,7 +373,7 @@ pub fn wp_print_match_line(title: &str) -> Option<u64> {
     lines.into_iter().last()
 }
 
-pub fn wp_print_sections(hypotheses: &[String]) -> Vec<serde_json::Value> {
+pub(crate) fn wp_print_sections(hypotheses: &[String]) -> Vec<serde_json::Value> {
     let labels = ["Heap", "Pre-condition", "Invariant", "Then", "Else", "Residual"];
     hypotheses
         .iter()
@@ -454,7 +454,7 @@ pub fn attach_why3_dumps(vcs: &mut [serde_json::Value], dumps: &[serde_json::Val
     }
 }
 
-pub fn vc_wp_print_kind(vc: &serde_json::Value) -> &str {
+pub(crate) fn vc_wp_print_kind(vc: &serde_json::Value) -> &str {
     if let Some(goal_kind) = vc.get("goal_kind").and_then(|value| value.as_str()) {
         if goal_kind == "user_assert" || goal_kind.starts_with("rte_") {
             return "assert";
@@ -474,7 +474,7 @@ pub fn vc_wp_print_kind(vc: &serde_json::Value) -> &str {
         .unwrap_or("unknown")
 }
 
-pub fn vc_source_line(vc: &serde_json::Value) -> Option<u64> {
+pub(crate) fn vc_source_line(vc: &serde_json::Value) -> Option<u64> {
     vc.get("source_location")
         .and_then(|loc| loc.get("line"))
         .and_then(|value| value.as_u64())
@@ -487,6 +487,6 @@ pub fn vc_source_line(vc: &serde_json::Value) -> Option<u64> {
         })
 }
 
-pub fn runtime_check_coverage_warning() -> &'static str {
+pub(crate) fn runtime_check_coverage_warning() -> &'static str {
     "Runtime checks cover only executed paths and do not validate assigns clauses."
 }

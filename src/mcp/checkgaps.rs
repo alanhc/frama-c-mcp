@@ -81,11 +81,11 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
             };
 
             // A clean run is exactly when vacuity is worth testing, and exactly
-            // when nothing else prompts for it. check runs no smoke tests, so
-            // it cannot see a contract that proves by excluding its own branch:
-            // the goals are valid, the verdict is proved, and an over-strong
-            // requires has quietly removed the case the function exists to
-            // handle.
+            // when nothing else prompts for it. check runs no smoke tests
+            // unless asked, so it cannot see a contract that proves by
+            // excluding its own branch: the goals are valid, the verdict is
+            // proved, and an over-strong requires has quietly removed the case
+            // the function exists to handle.
             //
             // Carried in the reason rather than by redirecting the call. Two
             // stronger versions were tried and both were wrong: as an
@@ -95,10 +95,9 @@ pub fn check_next_call(inputs: NextCallInputs<'_>) -> serde_json::Value {
             // a clean run.
             let reason = if incomplete.is_empty() {
                 "Every goal is valid, which says the code matches the contract, not that \
-                 the contract was worth matching. check runs no vacuity tests: run_wp \
-                 {smoke: true, provers: [...]} is the only check that sees an over-strong \
-                 requires, which proves everything and silently excludes the branch it \
-                 forbids."
+                 the contract was worth matching. Smoke tests, which look for vacuity, are off by default: check \
+                 {smoke: true} is the check that sees an over-strong requires, which proves \
+                 everything and silently excludes the branch it forbids."
                     .to_string()
             } else {
                 check_blocked_reason(incomplete)
@@ -176,6 +175,17 @@ pub mod incomplete_code {
     pub const AST_UNKNOWN_ATTRIBUTE: &str = "AST_UNKNOWN_ATTRIBUTE";
     pub const AST_UNCLASSIFIED_WARNING: &str = "AST_UNCLASSIFIED_WARNING";
     pub const AST_PARSE_DIAGNOSTICS_UNAVAILABLE: &str = "AST_PARSE_DIAGNOSTICS_UNAVAILABLE";
+    pub const WP_VERIFICATION_SKIPPED: &str = "WP_VERIFICATION_SKIPPED";
+    pub const WP_ANNOTATION_SKIPPED: &str = "WP_ANNOTATION_SKIPPED";
+    pub const WP_UNSOUND_ENCODING: &str = "WP_UNSOUND_ENCODING";
+    pub const GENERATED_CALLEE_SPEC: &str = "GENERATED_CALLEE_SPEC";
+    pub const WP_WEAKENED_MODEL: &str = "WP_WEAKENED_MODEL";
+    pub const SMOKE_TEST_FAILED: &str = "SMOKE_TEST_FAILED";
+    pub const SMOKE_TEST_UNCHECKED: &str = "SMOKE_TEST_UNCHECKED";
+    pub const RTE_REDUCED: &str = "RTE_REDUCED";
+    pub const CHECK_NARROWED_BY_PROP: &str = "CHECK_NARROWED_BY_PROP";
+    pub const WP_MESSAGES_TRUNCATED: &str = "WP_MESSAGES_TRUNCATED";
+    pub const WP_GOALS_CHANGED_UNDER_CHECK: &str = "WP_GOALS_CHANGED_UNDER_CHECK";
 
     // Only the doc comparison reads the list as a list; the emit sites name
     // codes one at a time. It used to be cfg(test) gated, which stopped meaning
@@ -210,6 +220,17 @@ pub mod incomplete_code {
         AST_UNKNOWN_ATTRIBUTE,
         AST_UNCLASSIFIED_WARNING,
         AST_PARSE_DIAGNOSTICS_UNAVAILABLE,
+        WP_VERIFICATION_SKIPPED,
+        WP_ANNOTATION_SKIPPED,
+        WP_UNSOUND_ENCODING,
+        GENERATED_CALLEE_SPEC,
+        WP_WEAKENED_MODEL,
+        SMOKE_TEST_FAILED,
+        SMOKE_TEST_UNCHECKED,
+        RTE_REDUCED,
+        CHECK_NARROWED_BY_PROP,
+        WP_MESSAGES_TRUNCATED,
+        WP_GOALS_CHANGED_UNDER_CHECK,
     ];
 }
 
@@ -291,7 +312,9 @@ fn unrequested_analysis_gaps(
         // is sound. Read off the run rather than off the load flag, because the
         // run is what decided it.
         let wp_covered_runtime_errors = wanted.wp
-            && wp.pointer("/effective_wp_config/rte").and_then(serde_json::Value::as_bool)
+            && wp
+                .pointer("/effective_wp_config/rte")
+                .and_then(serde_json::Value::as_bool)
                 == Some(true);
         incomplete.push(json!({
             "code": incomplete_code::RTE_DISABLED,
@@ -355,16 +378,22 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
     let guidance = match code {
         incomplete_code::LEMMA_NOT_PROVED => {
             "An SMT prover does not do induction, so a lemma over a recursive logic function or an \
-             inductive predicate will not close by raising the timeout. Reach for the induction \
-             tactic instead, which WP registers as Wp.induction and drives through -wp-tactic, \
-             -wp-prover tip and -wp-script; or split the lemma into smaller ones the prover can \
-             chain. Until one of those lands, every goal that cites it is valid only under it."
+             inductive predicate will not close by raising the timeout. First write it as a lemma \
+             function, a ghost C function whose contract is the lemma and whose loop or recursion \
+             is the induction, which inject_all_annotations takes as ghost_lemma_function: WP's \
+             loop machinery then does the step SMT cannot. Only if that cannot express it, use \
+             the Wp.induction tactic through -wp-tactic, or split the lemma into ones the prover \
+             can chain. Until one lands, WP hands this lemma to every goal in scope as a \
+             hypothesis, so any valid goal may rest on it, and a goal count that drops once a \
+             false lemma is removed is the correct outcome."
         }
         incomplete_code::ASSUMED_VALID => {
-            "This property is recorded valid by assumption, not by proof. If the assumption is \
-             deliberate, keep the axiom and say so where a reader will see it; if it is not, \
-             remove the axiom and prove the property, because WP uses it as a hypothesis \
-             everywhere without ever checking it."
+            "This property is recorded valid by assumption, not by proof. WP uses it as a \
+             hypothesis everywhere without ever checking it, so one false axiom proves every \
+             goal in scope. Prefer a recursive logic definition with proved lemmas and remove \
+             the axiom. If the assumption is deliberate, say so where a reader will see it, and \
+             run check with smoke: true: an inconsistent axiom set shows up there as \
+             SMOKE_TEST_FAILED, and nowhere else."
         }
         incomplete_code::PROPERTY_DEAD => {
             "EVA proved this code unreachable, so proving anything about it constrains no run. \
@@ -409,9 +438,272 @@ pub fn gap_guidance(code: &str) -> serde_json::Value {
              caller passing the address of the global the function also writes proves too, and \
              is wrong at run time."
         }
+        incomplete_code::WP_VERIFICATION_SKIPPED => {
+            "WP refused this function outright and generated no goal for its contract, so nothing \
+             here was proved about it, whatever the goal count says. A non-natural loop is a goto \
+             back-edge or a jump into a loop: rewrite it as while, for or do-while. A recursive \
+             entry point is real recursion reached from the entry function, which needs a \
+             non-recursive wrapper."
+        }
+        incomplete_code::WP_ANNOTATION_SKIPPED => {
+            "WP discarded this annotation without proving or using it, and the goals around it \
+             still report valid. A statement contract has to become a function with its own \
+             contract; a statement-level invariant has to become a loop invariant or an assert at \
+             that point."
+        }
+        incomplete_code::WP_UNSOUND_ENCODING => {
+            "WP warned that its encoding of this construct can prove things that are false, and a \
+             goal reported valid under it is not evidence. For union access, do not state \
+             properties across members: use a tagged struct, or keep the union in unverified \
+             code. For a logic function declared without a definition, give it a body or an \
+             explicit reads clause, because reads nothing makes every frame property about it \
+             hold vacuously."
+        }
+        incomplete_code::GENERATED_CALLEE_SPEC => {
+            "This callee has neither code nor a specification, so the kernel invented one: it \
+             terminates, never exits, and assigns only through its pointer parameters, never a \
+             global. Every caller's proof rests on that guess. Write the callee's real contract, \
+             at least assigns, terminates and exits, in the header callers include."
+        }
+        incomplete_code::WP_WEAKENED_MODEL => {
+            "This run used a WP model selector that departs from C semantics, so a goal proved \
+             here may be false for the compiled program. +cast allows unsafe pointer casts, +nat \
+             treats machine integers as unbounded, and +real treats floating point as exact \
+             reals. Prove under the default Typed+nocast, or report the result as holding only \
+             under the named selectors."
+        }
+        incomplete_code::SMOKE_TEST_FAILED => {
+            "WP proved a smoke goal, so something in scope is unreachable or contradictory and the \
+             goals around it prove for the wrong reason. The goal name says which: requires or \
+             assumes means no state satisfies the precondition, dead_code or dead_call a statement \
+             no execution reaches, dead_loop a loop body that never runs. Fix the specification or \
+             the code, never the smoke test."
+        }
+        incomplete_code::RTE_REDUCED => {
+            "This load checked runtime errors without unsigned wraparound and narrowing, because \
+             it was loaded with rte_unsigned: false. That is right for code whose idioms wrap by \
+             design, such as a countdown loop over an unsigned counter or a byte read through a \
+             char conversion, and nothing else catches a real unsigned bug there. Say which \
+             idiom forced it where the result is reported, and load without it everywhere else."
+        }
+        incomplete_code::WP_GOALS_CHANGED_UNDER_CHECK => {
+            "The goal table changed between this check's proof run and the read of its goals, so \
+             the goals reported are not the ones the run produced. Another call on the same \
+             session reloaded the project or ran WP in that window. Nothing here describes one \
+             run, so no part of it is evidence; run check again on a quiet session."
+        }
+        incomplete_code::WP_MESSAGES_TRUNCATED => {
+            "The analyzer's message stream could not be read to the end, and four of the gates \
+             above are derived from it alone: a skipped function, a dropped annotation, an \
+             unsound encoding and an invented callee contract are all reported by message and by \
+             nothing else. So this run cannot tell a clean message stream from one it failed to \
+             read, and the goals it did prove stand only as far as that. Run check again; if it \
+             repeats, the analyzer is not answering and nothing here is evidence."
+        }
+        incomplete_code::CHECK_NARROWED_BY_PROP => {
+            "This check ran WP under a prop filter, so it proved the selected properties and never \
+             attempted the rest. It is not a verdict about the function or the file, whatever the \
+             goals it did prove came back as, and it cannot be proved for that reason alone. Use \
+             it to iterate on one property, then run check without prop before believing anything \
+             about the whole."
+        }
+        incomplete_code::SMOKE_TEST_UNCHECKED => {
+            "Smoke tests were requested and did not run, so whether the specification is vacuous \
+             is unknown rather than answered. The entry's reason says why; run check again once it \
+             is resolved."
+        }
         _ => return serde_json::Value::Null,
     };
     json!(guidance)
+}
+
+/// The smoke probe's findings, when the caller asked for smoke tests.
+///
+/// Nothing when they were not requested: check runs no smoke probe by default,
+/// and an absent probe is then the expected state rather than a gap.
+pub fn smoke_test_gaps(requested: bool, wp: &serde_json::Value) -> Vec<serde_json::Value> {
+    if !requested {
+        return Vec::new();
+    }
+    let probe = wp.get("smoke_probe");
+    let Some(probe) =
+        probe.filter(|probe| probe.get("ran").and_then(serde_json::Value::as_bool) == Some(true))
+    else {
+        let reason = probe
+            .and_then(|probe| probe.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("WP did not complete, so no smoke probe ran");
+        return vec![json!({
+            "code": incomplete_code::SMOKE_TEST_UNCHECKED,
+            "reason": reason,
+        })];
+    };
+    let failed = probe
+        .get("failed")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let passed = probe.get("passed").and_then(serde_json::Value::as_u64);
+    let total = probe.get("total").and_then(serde_json::Value::as_u64);
+
+    // The summary is the count and the goal lines are the names. Either one
+    // saying a smoke goal was proved is enough, so a reworded goal line cannot
+    // hide a failure the summary still counts.
+    //
+    // The summary's own arithmetic, total minus passed, rather than one per
+    // summary that disagrees: WP prints a "[Failed] (Doomed)" line for some
+    // smoke goals and not for others, measured at 0 / 2 with one name, so
+    // counting the names alone said one where two were proved.
+    let summary_failed = match (passed, total) {
+        (Some(passed), Some(total)) if passed < total => (total - passed) as usize,
+        _ => 0,
+    };
+
+    // A probe that ran and printed no summary answered nothing, and silence
+    // here would read as "every smoke test passed". WP prints no "Smoke Tests:"
+    // line at all when it generates no smoke goal, which happens for a scope
+    // with no requires, no branch, no loop and no call: measured on Frama-C 33,
+    // "Proved goals: 4 / 4" and no smoke line, and the same for a scope whose
+    // axiomatic carries "0 == 1", which is exactly what smoke tests exist to
+    // catch. parse_smoke_output leaves passed and total null rather than zero
+    // for this reason, so the null is reported rather than rounded down.
+    if total.is_none() {
+        return vec![json!({
+            "code": incomplete_code::SMOKE_TEST_UNCHECKED,
+            "reason": "The smoke probe ran and WP printed no smoke summary, so no smoke goal was \
+                       generated and whether the specification is vacuous is unanswered.",
+        })];
+    }
+    if failed.is_empty() && summary_failed == 0 {
+        return Vec::new();
+    }
+    vec![json!({
+        "code": incomplete_code::SMOKE_TEST_FAILED,
+        "reason": format!(
+            "WP proved {} smoke goal(s), so part of what was proved holds over no execution.",
+            failed.len().max(summary_failed)
+        ),
+        "failed": failed,
+        "passed": passed,
+        "total": total,
+    })]
+}
+
+/// The selectors in a WP model string that give up C semantics.
+///
+/// From frama-c -wp-h on 33.0: "+cast" is described as unsafe pointer casts,
+/// "+nat" as natural rather than machine integers, "+real" as real rather than
+/// IEEE floating-point arithmetic. acsl-skills' memory-models reference names
+/// the same three as proofs about something other than the compiled program.
+/// "+int", "+float" and "+nocast" are the sound counterparts and are not
+/// reported. -wp-weak-int-model is the fourth such setting, and no path in
+/// this server passes it.
+pub fn weakening_model_selectors(model: Option<&str>) -> Vec<String> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    model
+
+        // A model may name alternatives, for example Typed+cast,Bytes. The
+        // modifiers belong to each alternative, not just the first whole
+        // string, so split the alternatives before looking for '+' selectors.
+        .split(',')
+        .flat_map(|alternative| alternative.split('+').skip(1))
+        .map(|selector| selector.trim().to_ascii_lowercase())
+        .filter(|selector| matches!(selector.as_str(), "cast" | "nat" | "real"))
+        .map(|selector| format!("+{selector}"))
+        .collect()
+}
+
+/// The WP and kernel messages of one check call that mean part of the work was
+/// skipped, dropped, or encoded unsoundly, as incomplete[] entries.
+///
+/// check's verdict is "incomplete[] is empty", and before these codes every one
+/// of the following answered proved with nothing in incomplete[], the evidence
+/// sitting in messages[] alone. Measured on Frama-C 33.0: a statement contract
+/// and a statement-level invariant were dropped, a union written through one
+/// member proved a false property of another, an undefined labelled logic
+/// function proved a false frame property, and check scoped to a function that
+/// has callers got no goal for its false postcondition. acsl-skills' wp.sh
+/// greps for the same strings, which is where the list comes from.
+///
+/// Matched on the text WP 33.0 prints. A rewording fails open, which is why
+/// each one has a fixture test.
+pub fn wp_message_gaps(
+    messages: &[serde_json::Value],
+    model: Option<&str>,
+) -> Vec<serde_json::Value> {
+    // One entry per code and message text, with every place it was printed. WP
+    // repeats the union warning at each access, and an entry per access grows
+    // the payload with the program rather than with the findings.
+    let mut gaps: Vec<serde_json::Value> = Vec::new();
+    for message in messages {
+        let field = |name: &str| {
+            message
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        };
+        let text = field("message");
+        let (plugin, kind) = (field("plugin"), field("kind"));
+        let code = if plugin == "wp"
+            && kind.eq_ignore_ascii_case("error")
+            && text.contains("skipped verification")
+        {
+            incomplete_code::WP_VERIFICATION_SKIPPED
+        } else if plugin == "wp" && text.contains("not yet supported (skipped)") {
+            incomplete_code::WP_ANNOTATION_SKIPPED
+        } else if plugin == "wp"
+            && (text.contains("might be unsound") || text.contains("interpreted as reads nothing"))
+        {
+            incomplete_code::WP_UNSOUND_ENCODING
+        } else if plugin == "kernel"
+            && field("category") == "annot:missing-spec"
+            && text.contains("Neither code nor specification for function")
+        {
+            incomplete_code::GENERATED_CALLEE_SPEC
+        } else {
+            continue;
+        };
+        let source = message
+            .get("source")
+            .cloned()
+            .filter(|source| !source.is_null());
+        let first_line = text.lines().next().unwrap_or_default();
+        let existing = gaps
+            .iter_mut()
+            .find(|gap| gap["code"] == code && gap["reason"] == first_line);
+        let gap = match existing {
+            Some(gap) => gap,
+            None => {
+                gaps.push(json!({
+                    "code": code,
+                    "reason": first_line,
+                    "message": text,
+                    "locations": [],
+                }));
+                gaps.last_mut().expect("just pushed")
+            }
+        };
+        if let (Some(source), Some(locations)) = (source, gap["locations"].as_array_mut()) {
+            if !locations.contains(&source) {
+                locations.push(source);
+            }
+        }
+    }
+    let weakenings = weakening_model_selectors(model);
+    if !weakenings.is_empty() {
+        gaps.push(json!({
+            "code": incomplete_code::WP_WEAKENED_MODEL,
+            "reason": format!(
+                "This run's memory model uses {}, which departs from C semantics.",
+                weakenings.join(", ")
+            ),
+            "model": model,
+            "selectors": weakenings,
+        }));
+    }
+    gaps
 }
 
 /// The probe entries that name a function and the separations WP assumed for
@@ -434,7 +726,11 @@ fn parsed_hypothesis_entries(probe: &serde_json::Value) -> Vec<serde_json::Value
 fn unparsed_hypothesis_warnings(probe: &serde_json::Value) -> u64 {
     hypothesis_entries(probe)
         .iter()
-        .filter_map(|entry| entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64))
+        .filter_map(|entry| {
+            entry
+                .get("unparsed_warning_count")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum()
 }
 
@@ -1039,7 +1335,9 @@ pub(crate) type DigestGroups = std::collections::HashMap<String, Vec<(String, As
 /// than path, so one YAML under two paths is still one machine.
 pub fn machdep_digest(machdep: Option<&str>) -> Option<String> {
     let file = std::fs::File::open(machdep?).ok()?;
-    crate::state::sha256_hex_of_reader(file).ok().map(|(digest, _)| digest)
+    crate::state::sha256_hex_of_reader(file)
+        .ok()
+        .map(|(digest, _)| digest)
 }
 
 /// What two variants must share to have analysed the same program: the printed

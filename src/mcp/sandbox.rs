@@ -191,6 +191,15 @@ impl FramaCMcpServer {
             }
         }
 
+        // Before anything is created, because the failure it prevents happens
+        // at connect time and says only "path must be shorter than SUN_LEN",
+        // which names neither the experiment_id nor the limit. A sandbox's
+        // socket lives inside its directory, and that directory carries the
+        // caller's id, so an id the path segment check accepts at 128 can still
+        // put the socket past the cap: measured on this machine, an id of 100
+        // characters created the directory and then failed to connect.
+        crate::mcp::store::sandbox_socket_path_error(&sandbox_dir)?;
+
         // The root first, and checked, because create_dir_all would otherwise
         // make it as a side effect with whatever the umask says, which is the
         // 0755 the check below exists to refuse. What lands in here is the C

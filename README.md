@@ -189,6 +189,26 @@ The arguments the client passes:
 Once connected, drive it in English rather than by naming tools; the agent picks
 the calls. [Prompt patterns](#prompt-patterns) is the table of what to say.
 
+### Pair it with agent skills
+
+The server supplies evidence and says nothing about how to write ACSL or when a
+proof counts as done. An agent skill carries that half.
+
+`skills/frama-c-proofreader` ships in this repository, in the Agent Skills
+layout (`SKILL.md`, `references/`, an `agents/openai.yaml` for Codex). It tells
+an agent to prefer these tools, to dry-run an injection before applying it, to
+run a smoke test before calling a function verified, and to report environment
+failures, static proof gaps, runtime violations and proofs under assumptions as
+four separate outcomes. Its `scripts/verify.sh` runs WP over the bundled
+`abs-int` pair, expecting the overflow gap in one and a full proof of the
+other, and E-ACSL over the buggy half where E-ACSL is installed. Copy the
+directory into the agent's skills location:
+
+```bash
+cp -r skills/frama-c-proofreader ~/.claude/skills/   # Claude Code
+cp -r skills/frama-c-proofreader ~/.agents/skills/   # Codex
+```
+
 ### CLI escape hatch for CI
 
 The `check` subcommand runs the same code path as the `check` tool and prints
@@ -380,6 +400,12 @@ missing either discharges a different set than the target's own command does.
 A profile written before those two were required still loads; it is refused only
 where it would have become evidence, and stating them restores it.
 
+`rte_unsigned` is optional, and true when unset: with `rte`, the load checks
+unsigned wraparound and narrowing as well, which Frama-C leaves off by default.
+Set it to `false`, on the profile or on `reload_project` and `check`, only for
+code whose idioms wrap by design; a run under it reports `RTE_REDUCED`, and a
+receipt made under it names the setting in its load identity.
+
 Two further fields are optional, and say what this server cannot otherwise
 know. `min_goals` is the floor on obligations the target requires WP to
 *generate*, and a run that generates fewer is refused: "N of N discharged" is
@@ -465,8 +491,15 @@ under-reports and a short one looks the same as a complete one.
 For conclusions, `status` filters the summaries and `function` returns one full
 conclusion.
 
-`run_wp` accepts `smoke: true` together with `provers` to run isolated CLI
-smoke tests.
+`check` and `run_wp` accept `smoke: true` to run WP's smoke tests beside the
+proof, in a separate Frama-C over the printed AST this session holds. `check`
+reports a smoke goal WP proves as `SMOKE_TEST_FAILED`, and `run_wp` returns the
+probe under `smoke_probe`. The probe runs with the proof run's own provers,
+parallelism and timeout, and reports `provers`, `parallel` and `elapsed_ms`:
+measured on `tests/fixtures/smoke-vacuous.c`, it added about 3 s to a 9.5 s
+`check`. `run_wp` with `smoke: true` and `provers` keeps the
+isolated command-line route instead, over the files on disk, with smoke counts
+on each attempt.
 
 ### `self_check`
 
@@ -499,6 +532,13 @@ answered `invalid`.
 `capabilities.known_frama_c_version_limitations` repeats the reason and is
 derived from the same probe, so it cannot go stale against the version actually
 installed.
+
+When the configured `frama-c` cannot be run at all, `frama_c_candidates` lists
+the opam switches whose `bin` holds one, with a `hint` naming the first: start
+the server with that `--frama-c`, or activate that switch, and install
+ast-utils into the same switch. `opam_switch_hint` beside it only names the
+current switch, which is the one that just failed. The field is null when
+`frama-c` runs.
 
 `self_check` also accepts `canary: true`. The request probes report which
 requests answer; they cannot report whether EVA and WP still catch anything, and
@@ -598,6 +638,10 @@ payload contract and the change rule. The full set:
 | Code | Meaning |
 |------|---------|
 | `RTE_DISABLED` | Ran without RTE, so no alarms does not exclude runtime errors |
+| `RTE_REDUCED` | Ran RTE with `rte_unsigned: false`, so unsigned wraparound and narrowing were not checked |
+| `WP_GOALS_CHANGED_UNDER_CHECK` | The goal table changed between the proof run and the read of its goals, so the goals reported are not the ones that run produced |
+| `WP_MESSAGES_TRUNCATED` | The analyzer's message stream was not read to the end, so the four message-derived gates cannot tell a clean run from an unread one |
+| `CHECK_NARROWED_BY_PROP` | Ran WP under a `prop` filter, so only the selected properties were attempted and the verdict does not cover the rest |
 | `EVA_NOT_RUN` | EVA did not complete, so `eva_alarms` proves nothing |
 | `WP_NOT_RUN` | WP did not complete, so `wp_goals` proves nothing |
 | `WP_STILL_RUNNING` | WP was working when its goals were read, so a goal may be missing entirely |
@@ -624,6 +668,13 @@ payload contract and the change rule. The full set:
 | `AST_ASM_CLOBBER` | Frama-C assumed inline assembly has no effects beyond its operands, so the analyzed statement is weaker than the compiled one |
 | `AST_UNKNOWN_ATTRIBUTE` | Frama-C ignored an unknown attribute, so the analyzed declaration differs from the source |
 | `AST_UNCLASSIFIED_WARNING` | Frama-C emitted parse warnings in categories this server has not classified, so their effect on the analyzed program is unknown |
+| `WP_VERIFICATION_SKIPPED` | WP refused a function outright, a non-natural loop or a recursive entry point, and generated no goal for its contract |
+| `WP_ANNOTATION_SKIPPED` | WP discarded an annotation it does not support, a statement contract or a statement-level invariant, while the goals around it still report valid |
+| `WP_UNSOUND_ENCODING` | WP warned that its encoding can prove false properties here: union access across members, or a logic function interpreted as reading nothing |
+| `GENERATED_CALLEE_SPEC` | A callee with neither code nor specification got a contract the kernel invented, which every caller's proof rests on |
+| `WP_WEAKENED_MODEL` | The run's memory model used a selector that departs from C semantics: `+cast` (unsafe pointer casts), `+nat` (unbounded integers) or `+real` (exact reals) |
+| `SMOKE_TEST_FAILED` | Smoke tests were requested and WP proved a smoke goal, so something in scope is unreachable or contradictory and the goals around it prove for the wrong reason |
+| `SMOKE_TEST_UNCHECKED` | Smoke tests were requested and did not run, so whether the specification is vacuous is unknown |
 | `AST_PARSE_DIAGNOSTICS_UNAVAILABLE` | This server has no record of what the front end dropped, so nothing says the analyzed program is the compiled one |
 
 Treat the set as additive: codes are added as gaps are found, and three were
@@ -776,11 +827,20 @@ one.
 
 ### Proof evidence
 
-Each goal also reports `from_cache`. Frama-C's `-wp-cache` defaults to
-`update`, so WP reuses verdicts it proved in earlier runs; such a verdict is a
-real proof of that obligation by that prover, but not one the current run
-performed, and the receipt records the difference. Pass
+Each goal also reports `from_cache`, as `true`, `false` or `null`. Frama-C's
+`-wp-cache` defaults to `update`, so WP reuses verdicts it proved in earlier
+runs; such a verdict is a real proof of that obligation by that prover, but not
+one the current run performed, and the receipt records the difference. Pass
 `run_wp {cache: "None"}` to prove everything in this run.
+
+The value comes from the plug-in, which reads the cache flag of the prover
+result WP itself selected for the goal, in one request per goal fetch. `null`
+means unknown, and a consumer counts it as neither replayed nor fresh: the
+plug-in is older than the request, the request failed, or WP does not know that
+goal. Do not read it off the `(Cached)` word in a goal's `stats.summary`: WP
+prints that for every cacheable goal whenever the cache mode is updating,
+whether or not anything was replayed, so a freshly computed proof carries it
+too.
 
 A proof is only as good as what it assumed. `run_wp` reports an
 `assumed_callee_contract` finding for every callee whose contract it took on
@@ -854,7 +914,7 @@ reload_project -> verify_program_step
 
 ## Testing
 
-Use the gate runner locally; it runs all thirteen repository checks, keeps logs
+Use the gate runner locally; it runs every repository check, keeps logs
 under `target/gate-logs`, and names failed tests. A unit test pins the runner
 against the CI workflows, so the two cannot drift apart.
 
@@ -951,9 +1011,14 @@ and that is the only link the two have.
 
 ### Callee contracts
 
-A bare declaration without a contract defaults to `assigns \nothing`, which is
-unsound for many callees. Sandbox extraction emits empty-body stubs for callees
-that lack explicit `assigns`.
+A bare declaration without a contract gets one Frama-C generates
+(`annot:missing-spec`), whose `assigns` never lists a global, only `\result` and
+what non-`const` pointer parameters reach, so a caller relying on a global
+across the call can prove while false. A defined function with no `assigns`
+instead warns `wp:pedantic-assigns` and its callers assume it writes anything,
+which is why sandbox extraction emits empty-body stubs for callees that lack
+explicit `assigns`; both cases are measured on Frama-C 33 in
+[docs/writing-acsl.md](docs/writing-acsl.md#callee-contracts).
 
 ## License
 

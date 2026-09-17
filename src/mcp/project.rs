@@ -469,9 +469,95 @@ impl FramaCMcpServer {
             rte: flag(params.rte, |p| p.rte),
             isystem_paths: list(params.isystem_paths.take(), |p| &p.isystem_paths),
             nostdinc: flag(params.nostdinc, |p| p.nostdinc),
+
+            // Checked unless the call or the profile says otherwise: the only
+            // flag here whose unset state means true.
+            unsigned_rte_skipped: params
+                .rte_unsigned
+                .or_else(|| profile.and_then(|profile| profile.rte_unsigned))
+                == Some(false),
         };
         validate_project_options(&options)?;
         Ok((requested_files, options))
+    }
+
+    /// The file list this load names.
+    ///
+    /// Its own step because it is the one part of reload_project that answers
+    /// from its arguments and the session's own record rather than from the
+    /// live analyzer, and because the four cases below are a decision rather
+    /// than a sequence.
+    /// Takes the one option it needs rather than the whole load, so it is not
+    /// a reader that has to be revisited when a field is added.
+    async fn files_for_this_load(
+        &self,
+        requested_files: Option<Vec<String>>,
+        compilation_database: Option<&String>,
+    ) -> Result<Vec<String>, McpError> {
+    // Determine file list:
+    // - explicit files: use
+    // - compilation database without files: load file entries from it
+    // - None + already loaded: use the current files loaded by frama-c
+    // - None + not loaded: error (cannot guess in lazy mode)
+    //
+    // Matched as a pair rather than guarded on is_some, so the database arm is
+    // handed the database instead of re-fetching one the guard had already
+    // found. A guard cannot bind, which is the whole reason the old arm had to
+    // assert.
+    let files = match (requested_files, compilation_database) {
+        (Some(f), _) => f,
+        (None, Some(database)) => compile_database_files(database)?,
+        (None, None) => {
+            let client_opt = self.client.lock().await.clone();
+            match client_opt {
+                Some(c) if c.is_poisoned() => {
+                    // The dead transport cannot answer getFiles, so the file
+                    // list comes from the session's cache of the last load
+                    // instead. ensure_main_spawned reads the same flag and
+                    // respawns, which is what makes the fallback a recovery
+                    // rather than a stale answer.
+                    let files = self
+                        .main_frama_c_state
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|s| s.files.clone())
+                        .unwrap_or_default();
+                    if files.is_empty() {
+                        return Err(McpError::internal_error(
+                            "the Frama-C transport is poisoned and no file list is cached; \
+                             pass files explicitly to reload_project to recover",
+                            Some(json!({
+                                "kind": "TransportPoisoned",
+                                "retryable": true,
+                                "suggestion": {
+                                    "tool": "reload_project",
+                                    "args_example": { "files": ["/path/to/source.c"] }
+                                }
+                            })),
+                        ));
+                    }
+                    files
+                }
+                Some(c) => {
+                    let v = c
+                        .get("kernel.ast.getFiles", json!(null))
+                        .await
+                        .map_err(McpError::from)?;
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                None => return Err(no_project_loaded_error()),
+            }
+        }
+    };
+
+        Ok(files)
     }
 
     #[tool(
@@ -529,68 +615,9 @@ impl FramaCMcpServer {
             }
         };
 
-        // Determine file list:
-        // - explicit files: use
-        // - compilation database without files: load file entries from it
-        // - None + already loaded: use the current files loaded by frama-c
-        // - None + not loaded: error (cannot guess in lazy mode)
-        //
-        // Matched as a pair rather than guarded on is_some, so the database arm
-        // is handed the database instead of re-fetching one the guard had
-        // already found. A guard cannot bind, which is the whole reason the old
-        // arm had to assert.
-        let files = match (requested_files, project_options.compilation_database.as_ref()) {
-            (Some(f), _) => f,
-            (None, Some(database)) => compile_database_files(database)?,
-            (None, None) => {
-                let client_opt = self.client.lock().await.clone();
-                match client_opt {
-                    Some(c) if c.is_poisoned() => {
-                        // The dead transport cannot answer getFiles, so the
-                        // file list comes from the session's cache of the last
-                        // load instead. ensure_main_spawned reads the same flag
-                        // and respawns, which is what makes the fallback a
-                        // recovery rather than a stale answer.
-                        let files = self
-                            .main_frama_c_state
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|s| s.files.clone())
-                            .unwrap_or_default();
-                        if files.is_empty() {
-                            return Err(McpError::internal_error(
-                                "the Frama-C transport is poisoned and no file list is cached; \
-                                 pass files explicitly to reload_project to recover",
-                                Some(json!({
-                                    "kind": "TransportPoisoned",
-                                    "retryable": true,
-                                    "suggestion": {
-                                        "tool": "reload_project",
-                                        "args_example": { "files": ["/path/to/source.c"] }
-                                    }
-                                })),
-                            ));
-                        }
-                        files
-                    }
-                    Some(c) => {
-                        let v = c
-                            .get("kernel.ast.getFiles", json!(null))
-                            .await
-                            .map_err(McpError::from)?;
-                        v.as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    }
-                    None => return Err(no_project_loaded_error()),
-                }
-            }
-        };
+        let files = self
+            .files_for_this_load(requested_files, project_options.compilation_database.as_ref())
+            .await?;
 
         // Before the spawn reads it, so an edit during the analysis that
         // follows cannot change which machine this load is said to have used.
@@ -605,6 +632,19 @@ impl FramaCMcpServer {
         // back empty and the sandbox path has no function cache to resolve
         // against.
         let client = self.require_client().await?;
+
+        // Set on every load, both ways, before any analysis reads them. They
+        // decide which alarms EVA emits as well as which guards WP generates,
+        // so setting them only where WP generates guards made a second check in
+        // one session report unsigned alarms the first one did not. The
+        // command-line paths pass the same options, from UNSIGNED_RTE_OPTIONS.
+        let unsigned = project_options.unsigned_rte();
+        for setter in [
+            "kernel.parameters.setWarnUnsignedOverflow",
+            "kernel.parameters.setWarnUnsignedDowncast",
+        ] {
+            client.set(setter, json!(unsigned)).await.map_err(McpError::from)?;
+        }
 
         // Read and memoize under one lock. Splitting the two across the
         // ast_reload_health await let a concurrent reload reset the offsets in
@@ -1092,6 +1132,7 @@ impl FramaCMcpServer {
             // passes measures a different program than the build parses.
             isystem_paths: params.isystem_paths.unwrap_or_default(),
             nostdinc: params.nostdinc.unwrap_or(false),
+            unsigned_rte_skipped: false,
         };
         validate_project_options(&options)?;
         let args = project_cli_args(&options);
@@ -1586,6 +1627,7 @@ pub fn validate_project_options(options: &ProjectLoadOptions) -> Result<(), McpE
         // Booleans, with no spelling to get wrong.
         rte: _,
         nostdinc: _,
+        unsigned_rte_skipped: _,
     } = options;
 
     validate_cpp_entries(

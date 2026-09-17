@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::state::VerificationStatus;
 
 use crate::state::{
-    sha256_hex, FunctionVerificationState, ProjectVerificationState, SandboxMetadata,
+    FunctionVerificationState, ProjectVerificationState, SandboxMetadata, sha256_hex,
 };
 
 /// Long-text conclusion fields, paired with what a missing .md file reads back
@@ -39,7 +39,7 @@ const LONG_TEXT_FIELDS: &[(&str, Option<&str>)] = &[
 /// experiment_id, so an entry an aborted run left behind makes the next
 /// create_sandbox reject the same id. Callers that need a clean slate per run,
 /// the test suite above all, point the variable at a directory of their own.
-pub fn conclusion_base_dir() -> PathBuf {
+pub(crate) fn conclusion_base_dir() -> PathBuf {
     std::env::var_os("FRAMA_C_MCP_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".frama-c-mcp"))
@@ -63,7 +63,7 @@ pub fn is_safe_path_segment(value: &str) -> bool {
 }
 
 /// Tool-boundary form of [`is_safe_path_segment`], with a caller-facing error.
-pub fn require_safe_path_segment(value: &str, field: &str) -> Result<(), McpError> {
+pub(crate) fn require_safe_path_segment(value: &str, field: &str) -> Result<(), McpError> {
     if is_safe_path_segment(value) {
         return Ok(());
     }
@@ -168,7 +168,7 @@ pub fn resolve_output_path_in(root: &Path, path: &str) -> Result<PathBuf, McpErr
     Ok(normalized)
 }
 
-pub fn conclusion_dir(func: &str) -> PathBuf {
+pub(crate) fn conclusion_dir(func: &str) -> PathBuf {
     conclusion_base_dir().join(func)
 }
 
@@ -215,7 +215,8 @@ pub fn persist_conclusion_at(
     let mut value = serde_json::to_value(conclusion)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(obj) = value.as_object_mut() {
-        let existing_files: Vec<String> = LONG_TEXT_FIELDS.iter()
+        let existing_files: Vec<String> = LONG_TEXT_FIELDS
+            .iter()
             .map(|(field, _)| format!("{}.md", field))
             .filter(|fname| dir.join(fname).is_file())
             .collect();
@@ -233,21 +234,26 @@ pub fn persist_conclusion_at(
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
 /// meta.json.
-pub fn persist_conclusion(func: &str, conclusion: &FunctionVerificationState) -> std::io::Result<()> {
+pub(crate) fn persist_conclusion(
+    func: &str,
+    conclusion: &FunctionVerificationState,
+) -> std::io::Result<()> {
     persist_conclusion_at(&conclusion_base_dir(), func, conclusion)
 }
 
 /// Write `ProjectVerificationState` to `<base_dir>/_program.json` atomically.
 /// Takes `base_dir` so tests can point at a tempdir; production calls
 /// `persist_program_state`.
-pub fn persist_program_state_at(base_dir: &Path, state: &ProjectVerificationState)
-    -> std::io::Result<()> {
+pub(crate) fn persist_program_state_at(
+    base_dir: &Path,
+    state: &ProjectVerificationState,
+) -> std::io::Result<()> {
     write_json_atomic(&base_dir.join("_program.json"), state)
 }
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
 /// `_program.json`.
-pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
+pub(crate) fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
     persist_program_state_at(&conclusion_base_dir(), state)
 }
 
@@ -291,7 +297,7 @@ const WRITER_TMP_STALE: std::time::Duration = std::time::Duration::from_secs(360
 ///
 /// Failures are ignored throughout. This is tidying, and a state directory that
 /// cannot be read or swept is a problem the caller will hit on its own terms.
-pub fn sweep_writer_temp_files(base_dir: &Path) {
+pub(crate) fn sweep_writer_temp_files(base_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir_or_cwd(base_dir)) else {
         return;
     };
@@ -377,7 +383,7 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> std::io::Res
     Ok(())
 }
 
-pub fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
+pub(crate) fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
     base_dir.join("sandboxes.json")
 }
 
@@ -411,6 +417,85 @@ pub fn expected_sandbox_dir(base_dir: &Path, experiment_id: &str) -> PathBuf {
         .collect();
     let owner = &sha256_hex(absolute.to_string_lossy().as_bytes())[..8];
     private_root_path().join(format!("sb-{owner}-{experiment_id}"))
+}
+
+/// Remove per-process Frama-C temp directories whose server is gone.
+///
+/// frama_c_tmp_dir names each one after the server that made it, and Drop
+/// removes it on a clean exit. A server killed with SIGKILL runs no Drop, so
+/// the directory outlives it with no owner: measured, a kill -9 left two
+/// behind and eight older ones had already accumulated under the private root.
+///
+/// Liveness rather than age, because age cannot tell a long proof from an
+/// orphan and this server can legitimately hold one open for hours. A pid that
+/// has been reused answers alive and the directory is kept, which is the safe
+/// direction: this only ever declines to delete.
+pub(crate) fn sweep_orphaned_frama_c_tmp_dirs() {
+    // Do not follow a pre-created /tmp/fcmcp-<uid> symlink merely to inspect
+    // it: the sweep removes children. The same validation every writer uses
+    // must happen before read_dir.
+    let Ok(root) = ensure_private_root() else {
+        return;
+    };
+    sweep_orphaned_frama_c_tmp_dirs_in(&root);
+}
+
+/// The sweep itself, against a named root so a test can own one.
+pub fn sweep_orphaned_frama_c_tmp_dirs_in(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let own = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("tmp-") else {
+            continue;
+        };
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == own || crate::mcp::proc::process_is_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Refuse a sandbox whose socket path would not fit in a Unix socket address.
+///
+/// sun_path is 108 bytes on Linux including the terminator, and the sandbox's
+/// socket is "frama-c.sock" inside a directory that carries the caller's
+/// experiment_id. is_safe_path_segment accepts an id of 128, which is longer
+/// than the remaining budget, so the two limits disagree and the socket one
+/// wins at connect time with an error naming neither the id nor the cap.
+///
+/// Measured rather than assumed: the path is built and counted here, so a
+/// change to the private root or to the sandbox directory scheme moves this
+/// check with it instead of leaving a stale constant behind.
+pub fn sandbox_socket_path_error(sandbox_dir: &Path) -> Result<(), McpError> {
+    // The terminator is the byte the cap includes and the string does not.
+    #[cfg(target_os = "macos")]
+    const SUN_PATH_MAX: usize = 104;
+    #[cfg(not(target_os = "macos"))]
+    const SUN_PATH_MAX: usize = 108;
+    let socket = sandbox_dir.join("frama-c.sock");
+    let len = socket.as_os_str().as_encoded_bytes().len();
+    if len + 1 > SUN_PATH_MAX {
+        return Err(McpError::invalid_params(
+            format!(
+                "experiment_id is too long for this sandbox's socket path: it would be {len} \
+                 bytes against a {SUN_PATH_MAX} byte limit. Use a shorter experiment_id, by \
+                 about {} characters.",
+                len + 1 - SUN_PATH_MAX
+            ),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// The directory this server keeps its scratch state in, named but not created.
@@ -451,7 +536,7 @@ pub fn private_root_path() -> PathBuf {
 /// or a genuinely confusing machine, and quietly chmod-ing somebody else's
 /// directory is not this program's business. lstat, not stat, so a symlink at
 /// the root is seen rather than followed.
-pub fn ensure_private_root() -> std::io::Result<PathBuf> {
+pub(crate) fn ensure_private_root() -> std::io::Result<PathBuf> {
     let root = private_root_path();
     ensure_private_dir(&root)?;
     Ok(root)
@@ -515,7 +600,7 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-pub fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
+pub(crate) fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
     let sandbox_dir = expected_sandbox_dir(base_dir, &sandbox.experiment_id);
     sandbox.sandbox_dir == sandbox_dir && sandbox.sandbox_socket == sandbox_dir.join("frama-c.sock")
 }
@@ -537,7 +622,7 @@ pub fn load_sandbox_metadata_from_disk(base_dir: &Path) -> Vec<SandboxMetadata> 
         .collect()
 }
 
-pub fn persist_sandbox_metadata_at(
+pub(crate) fn persist_sandbox_metadata_at(
     base_dir: &Path,
     sandboxes: &[SandboxMetadata],
 ) -> std::io::Result<()> {
@@ -566,7 +651,7 @@ pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<
     remember_sandbox_metadata_at(&conclusion_base_dir(), metadata)
 }
 
-pub fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
+pub(crate) fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
     let base_dir = conclusion_base_dir();
     let _guard = lock_state_dir(&base_dir)?;
     let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
@@ -606,7 +691,9 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         let func = match path.file_name().and_then(|s| s.to_str()) {
             Some(s) if is_safe_path_segment(s) => s.to_string(),
             _ => continue,

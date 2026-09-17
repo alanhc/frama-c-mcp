@@ -51,7 +51,14 @@ pub fn fixture_receipt(
         eva_config: serde_json::json!({}),
         goals,
         goals_status_source: "wp_fetch_goals",
-        reported: serde_json::json!({}),
+
+        // A check receipt's verdict, because that is what a receipt stored as
+        // verified evidence carries: the soundness gates run in check, and
+        // proof_receipt_evidence_error refuses a receipt that records no
+        // verdict precisely so a run_wp receipt cannot stand in for one. A
+        // fixture without it modelled a receipt no stored conclusion comes
+        // from, which is the drift this file exists to prevent.
+        reported: serde_json::json!({"verdict": "proved"}),
     }))
 }
 

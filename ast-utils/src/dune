@@ -42,6 +42,13 @@
  (public_name ast_utils.plugin)
  (libraries ast_utils frama-c.kernel frama-c-server.core frama-c-wp.core frama-c-rtegen.core)
  (modules ast_utils_register ast_utils_property)
+ ; getGoalCacheStats names WP's prover type, which 33 moved out of VCS into its
+ ; own Prover module, so this module carries version arms like the two in the
+ ; library above.
+ (preprocess
+  (per_module
+   ((action (run %{dep:../scripts/cppo-frama-c.sh} %{dep:framac-version} %{input-file}))
+    ast_utils_register)))
  (flags :standard)
  (modes byte native)
  (optional))

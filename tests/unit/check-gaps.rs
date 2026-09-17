@@ -12,6 +12,7 @@ use frama_c_mcp::mcp::server::analysis::{
 
 // The band this file was named after now has a module of its own in src/, for
 // the same reason this file came out of tests/unit/server.rs.
+use frama_c_mcp::mcp::server::wpcli::parse_smoke_output;
 use frama_c_mcp::mcp::server::checkgaps::{
     check_blocked_reason,
     check_incomplete_items,
@@ -20,6 +21,9 @@ use frama_c_mcp::mcp::server::checkgaps::{
     gap_guidance,
     incomplete_guidance,
     memory_model_hypothesis_gap,
+    smoke_test_gaps,
+    weakening_model_selectors,
+    wp_message_gaps,
     memory_model_unchecked_gap,
     probe_absent,
     check_next_call, incomplete_code, wp_goal_gaps, NextCallInputs,
@@ -1033,6 +1037,22 @@ fn prover_names_match_versioned_identifiers() {
     }
 }
 
+/// Every requested prover has to match, not just one of them.
+///
+/// A mixed list used to run on the provers that matched and switch the rest
+/// off in silence, while effective_wp_config still listed the whole request,
+/// so a proof was attributed to a prover that never ran.
+#[test]
+fn a_prover_that_matches_nothing_is_named_even_beside_one_that_matches() {
+    let ids = ["Alt-Ergo:2.6.3", "CVC4:1.8", "Z3:4.8.12"];
+    let request = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+
+    assert_eq!(unmatched_provers(&request(&["alt-ergo", "cvc5"]), &ids), ["cvc5"]);
+    assert_eq!(unmatched_provers(&request(&["cvc5"]), &ids), ["cvc5"]);
+    assert!(unmatched_provers(&request(&["alt-ergo", "z3"]), &ids).is_empty());
+    assert!(unmatched_provers(&request(&["why3:Alt-Ergo:2.6.3"]), &ids).is_empty());
+}
+
 /// A lemma is judged by its WP goals, and by all of them. `check` snapshots the
 /// property table before WP runs, so the property still reads `never_tried`
 /// after WP has proved the lemma; and a lemma split across goals must not read
@@ -1551,9 +1571,9 @@ fn a_crashed_backend_outranks_the_goal_it_left_unjudged() {
 /// With nothing to point at, the fallback says which sentence it means.
 ///
 /// "Nothing to target" and "nothing wrong" are different, and a clean run is
-/// exactly when vacuity is worth raising: check runs no smoke tests, so an
-/// over-strong requires proves everything and silently excludes the branch it
-/// forbids.
+/// exactly when vacuity is worth raising: check runs no smoke tests unless
+/// asked, so an over-strong requires proves everything and silently excludes
+/// the branch it forbids.
 #[test]
 fn the_fallback_separates_a_clean_run_from_a_blocked_one() {
     let empty = json!([]);
@@ -2040,4 +2060,209 @@ fn an_unread_warning_travels_beside_the_clauses_that_were_read() {
         memory_model_unchecked_gap(&probe, WantedAnalyses::BOTH).is_none(),
         "{probe:?}"
     );
+}
+
+/// The WP message gates: which texts they take, and that repeats collapse.
+#[test]
+fn wp_message_gaps_classify_and_collapse_repeats() {
+    let message = |plugin: &str, kind: &str, text: &str, line: u64| {
+        json!({"plugin": plugin, "kind": kind, "message": text, "source": {"base": "f.c", "line": line}})
+    };
+    let messages = [
+        message("wp", "ERROR", "Non-natural loop detected in function 'f'.\nThis case is not supported yet (skipped verification).", 3),
+        message("wp", "WARNING", "Statement specifications not yet supported (skipped).", 4),
+        message("wp", "WARNING", "Accessing union fields with Typed model might be unsound.\nPlease refer to WP manual.", 5),
+        message("wp", "WARNING", "Accessing union fields with Typed model might be unsound.\nPlease refer to WP manual.", 6),
+        json!({"plugin": "wp", "kind": "WARNING", "message": "No definition for 'val' interpreted as reads nothing"}),
+        {
+            let mut generated = message("kernel", "WARNING", "Neither code nor specification for function ext, generating default exits, assigns and terminates. See -generated-spec-* options for more info.", 7);
+            generated["category"] = json!("annot:missing-spec");
+            generated
+        },
+
+        // The same sentence from anywhere but the kernel's missing-spec
+        // category is not the invented contract.
+        message("kernel", "WARNING", "Neither code nor specification for function other, generating default exits, assigns and terminates.", 10),
+        // Present in every run with a contracted extern, and not a finding.
+        message("kernel", "WARNING", "Neither code nor explicit exits and terminates for function g, generating default clauses. See -generated-spec-* options for more info.", 8),
+        message("wp", "WARNING", "No 'assigns' specification for function 'main'.", 9),
+    ];
+    let gaps = wp_message_gaps(&messages, Some("Typed+nocast"));
+    let codes: Vec<&str> = gaps.iter().filter_map(|gap| gap["code"].as_str()).collect();
+    assert_eq!(
+        codes,
+        [
+            "WP_VERIFICATION_SKIPPED",
+            "WP_ANNOTATION_SKIPPED",
+            "WP_UNSOUND_ENCODING",
+            "WP_UNSOUND_ENCODING",
+            "GENERATED_CALLEE_SPEC",
+        ],
+        "{gaps:?}"
+    );
+    // The two union warnings are one finding printed at two places.
+    assert_eq!(gaps[2]["locations"].as_array().map(Vec::len), Some(2), "{gaps:?}");
+    // A message with no source still yields its entry.
+    assert_eq!(gaps[3]["locations"], json!([]), "{gaps:?}");
+
+    assert!(wp_message_gaps(&[], Some("Typed+nocast")).is_empty());
+    let cast = wp_message_gaps(&[], Some("Typed+cast"));
+    assert_eq!(cast.len(), 1);
+    assert_eq!(cast[0]["code"], "WP_WEAKENED_MODEL");
+    assert_eq!(cast[0]["selectors"], json!(["+cast"]));
+
+    // Every selector that leaves C semantics is named, and their sound
+    // counterparts are not.
+    assert_eq!(weakening_model_selectors(Some("Typed+nat+real")), ["+nat", "+real"]);
+    assert_eq!(weakening_model_selectors(Some("Typed+CAST+nat")), ["+cast", "+nat"]);
+    assert!(weakening_model_selectors(Some("Typed+nocast+int+float")).is_empty());
+    assert!(weakening_model_selectors(None).is_empty());
+}
+
+/// WP's smoke-test output as the probe reads it, and the gaps built from it.
+///
+/// The text is Frama-C 33.0's, measured on a function whose requires is
+/// contradictory: the doomed goal is printed twice and counted in the summary.
+#[test]
+fn smoke_probe_output_becomes_smoke_gaps() {
+    let failed_run = "[wp] 6 goals scheduled\n\
+        [wp] [Failed] (Doomed) typed_nocast_f_wp_smoke_default_requires (Qed)\n\
+        [wp] vac.c:4: Warning: Failed smoke-test\n\
+        [wp] [Failed] (Doomed) typed_nocast_f_wp_smoke_default_requires (Qed)\n\
+        [wp] Proved goals:    9 / 10\n\
+          Smoke Tests:       1 / 2\n";
+    let parsed = parse_smoke_output(failed_run);
+    assert_eq!(parsed["failed"], json!(["typed_nocast_f_wp_smoke_default_requires"]));
+    assert_eq!((parsed["passed"].as_u64(), parsed["total"].as_u64()), (Some(1), Some(2)));
+
+    let mut probe = parsed.clone();
+    probe["ran"] = json!(true);
+    let gaps = smoke_test_gaps(true, &json!({"smoke_probe": probe}));
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0]["code"], incomplete_code::SMOKE_TEST_FAILED);
+
+    // The count comes from the summary, not from the goal lines: WP prints one
+    // "[Failed] (Doomed)" line per doomed goal but repeats it, and the summary
+    // is what says how many of the smoke goals it proved.
+    assert!(
+        gaps[0]["reason"].as_str().is_some_and(|reason| reason.contains("1 smoke goal")),
+        "{gaps:?}"
+    );
+    let two_failed = json!({"smoke_probe": {"ran": true, "passed": 0, "total": 2, "failed": ["a"]}});
+    assert!(
+        smoke_test_gaps(true, &two_failed)[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("2 smoke goal")),
+        "the summary count must win over the goal lines"
+    );
+
+    // Not asked for: nothing, whatever the payload holds.
+    assert!(smoke_test_gaps(false, &json!({"smoke_probe": probe})).is_empty());
+
+    // A clean probe, and a run that generated no smoke goal at all.
+    let clean = json!({"smoke_probe": {"ran": true, "passed": 1, "total": 1, "failed": []}});
+    assert!(smoke_test_gaps(true, &clean).is_empty());
+    let none = parse_smoke_output("[wp] Proved goals:    3 / 3\n");
+    assert!(none["passed"].is_null() && none["total"].is_null(), "{none:?}");
+
+    // The summary alone still counts, so a reworded goal line cannot hide one.
+    let summary_only = json!({"smoke_probe": {"ran": true, "passed": 0, "total": 1, "failed": []}});
+    assert_eq!(smoke_test_gaps(true, &summary_only)[0]["code"], incomplete_code::SMOKE_TEST_FAILED);
+
+    // Asked for and not run: unchecked, carrying the probe's own reason.
+    let unchecked = smoke_test_gaps(true, &json!({"smoke_probe": {"ran": false, "reason": "timed out"}}));
+    assert_eq!(unchecked[0]["code"], incomplete_code::SMOKE_TEST_UNCHECKED);
+    assert_eq!(unchecked[0]["reason"], "timed out");
+    assert_eq!(smoke_test_gaps(true, &json!({}))[0]["code"], incomplete_code::SMOKE_TEST_UNCHECKED);
+}
+
+/// The prop selection rules: names, categories, exclusions.
+#[test]
+fn prop_filters_select_rows_by_name_kind_and_exclusion() {
+    let rows = [
+        json!({"key": "#p1", "kind": "assert", "names": ["one"]}),
+        json!({"key": "#p2", "kind": "assert", "names": ["two"]}),
+        json!({"key": "#p3", "kind": "ensures", "names": ["pos"]}),
+        json!({"key": "#p4", "kind": "loop_invariant", "names": []}),
+        json!({"key": "#p5", "kind": "assigns", "names": []}),
+    ];
+    let rows: Vec<&serde_json::Value> = rows.iter().collect();
+    let select = |prop: &str| frama_c_mcp::mcp::server::analysis::select_prop_rows(&rows, prop);
+
+    assert_eq!(select("two"), ["#p2"]);
+    assert_eq!(select("+two, pos"), ["#p2", "#p3"]);
+    assert_eq!(select("-one"), ["#p2", "#p3", "#p4", "#p5"]);
+    assert_eq!(select("@assert"), ["#p1", "#p2"]);
+    assert_eq!(select("@assert,-one"), ["#p2"]);
+    assert_eq!(select("@invariant"), ["#p4"]);
+    assert!(select("nope").is_empty());
+}
+
+/// The two gates that fail closed on evidence that was not read.
+///
+/// WP_MESSAGES_TRUNCATED: four codes are derived from the message stream and
+/// from nothing else, so an unread stream and a clean one both produce an empty
+/// list and the verdict came back proved.
+///
+/// WP_GOALS_CHANGED_UNDER_CHECK: run_wp drops main_wp_lock when it returns and
+/// check reads the goals afterwards, so a concurrent reload can clear the table
+/// in that window; the run's own goal count is what notices. It is skipped
+/// under prop, where retain_selected_goals trims the run's goals while the read
+/// back is the whole session table and the two legitimately differ (measured on
+/// prop-named-asserts.c: 4 against 7), and where the verdict can never be
+/// proved anyway.
+///
+/// "ok": false keeps the memory-model probe from spawning a process, so this
+/// stays a unit test.
+#[tokio::test]
+async fn evidence_that_was_not_read_fails_closed() {
+    use frama_c_mcp::mcp::server::analysis::RunEvidenceInputs;
+    use frama_c_mcp::mcp::server::checkgaps::WantedAnalyses;
+
+    let server = lazy_server("frama-c");
+    let wp = json!({"ok": false, "measurement": {"goals": 7}});
+    let codes = |gates: &frama_c_mcp::mcp::server::analysis::RunEvidenceGates| -> Vec<String> {
+        gates
+            .gaps
+            .iter()
+            .filter_map(|gap| gap["code"].as_str().map(str::to_string))
+            .collect()
+    };
+    let inputs = |truncated: bool, prop: Option<&'static str>, goals: &'static serde_json::Value| {
+        RunEvidenceInputs {
+            wanted: WantedAnalyses { eva: false, wp: true },
+            requested_smoke: false,
+            rte: false,
+            narrowed_by_prop: prop,
+            messages: &[],
+            messages_truncated: truncated,
+            wp: &wp,
+            wp_goals: goals,
+        }
+    };
+
+    static EMPTY: std::sync::LazyLock<serde_json::Value> =
+        std::sync::LazyLock::new(|| json!([]));
+    static SEVEN: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+        json!((0..7).map(|i| json!({"stable_goal_id": format!("g{i}")})).collect::<Vec<_>>())
+    });
+
+    // The run produced 7 and none were read back: the table moved.
+    let moved = codes(&server.run_evidence_gates(inputs(false, None, &EMPTY)).await);
+    assert!(moved.contains(&"WP_GOALS_CHANGED_UNDER_CHECK".to_string()), "{moved:?}");
+
+    // The same counts agree, so nothing is claimed.
+    let agreed = codes(&server.run_evidence_gates(inputs(false, None, &SEVEN)).await);
+    assert!(!agreed.contains(&"WP_GOALS_CHANGED_UNDER_CHECK".to_string()), "{agreed:?}");
+
+    // Under prop the two legitimately differ and the gate must stay quiet.
+    let narrowed = codes(&server.run_evidence_gates(inputs(false, Some("two"), &EMPTY)).await);
+    assert!(!narrowed.contains(&"WP_GOALS_CHANGED_UNDER_CHECK".to_string()), "{narrowed:?}");
+
+    // A short drain is reported whatever the goals say.
+    let truncated = codes(&server.run_evidence_gates(inputs(true, None, &SEVEN)).await);
+    assert!(truncated.contains(&"WP_MESSAGES_TRUNCATED".to_string()), "{truncated:?}");
+
+    let complete = codes(&server.run_evidence_gates(inputs(false, None, &SEVEN)).await);
+    assert!(!complete.contains(&"WP_MESSAGES_TRUNCATED".to_string()), "{complete:?}");
 }

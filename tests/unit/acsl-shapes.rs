@@ -94,22 +94,50 @@ fn a_wp_cache_mode_is_checked_before_it_is_sent() {
     assert!(rejected.contains("Cleanup"), "{rejected}");
 }
 
-/// The only signal Frama-C gives for a replayed verdict is a word in a
-/// free-form summary string, measured as `(Qed 31ms) (Alt-Ergo 37ms)
-/// (Cached)`. Lifted onto the goal so nothing downstream has to know that.
+/// from_cache is three-valued, and the summary is not consulted.
+///
+/// This test used to assert the opposite: that "(Cached)" in a goal's summary
+/// means the verdict was replayed, with "(Qed 39ms) (Alt-Ergo 41ms)" as its
+/// "fresh" example. Measured on Frama-C 33, that is wrong in the mode almost
+/// every call runs in. Stats.pp_stats prints the word for every cacheable goal
+/// whenever the cache mode is updating, hit or miss, and the second summary is
+/// only ever produced with the cache off. The flag now comes from the
+/// plug-in's getGoalCacheStats, which reads the cached flag of the result
+/// WP's own VCS.best selects, and an unanswered goal is null rather than a
+/// guess.
 #[test]
-fn a_replayed_verdict_is_marked_from_cache() {
-    let cached = json!({"stats": {"summary": " (Qed 31ms) (Alt-Ergo 37ms) (Cached)"}});
-    assert!(goal_is_from_cache(&cached));
+fn from_cache_is_three_valued_and_ignores_the_summary() {
+    let replayed = json!({"wpo": "g1", "from_cache": true});
+    let computed = json!({"wpo": "g2", "from_cache": false});
+    let unknown = json!({"wpo": "g3", "from_cache": serde_json::Value::Null});
+    assert_eq!(goal_is_from_cache(&replayed), Some(true));
+    assert_eq!(goal_is_from_cache(&computed), Some(false));
+    assert_eq!(goal_is_from_cache(&unknown), None);
 
-    for fresh in [
-        json!({"stats": {"summary": " (Qed 39ms) (Alt-Ergo 41ms)"}}),
-        json!({"stats": {"summary": " (CFG) (Trivial)"}}),
-        json!({"stats": {}}),
-        json!({}),
-    ] {
-        assert!(!goal_is_from_cache(&fresh), "{fresh}");
-    }
+    // The word in the summary says nothing either way now.
+    let summary_only = json!({"wpo": "g4", "stats": {"summary": " (Qed 31ms) (Alt-Ergo 37ms) (Cached)"}});
+    assert_eq!(goal_is_from_cache(&summary_only), None);
+
+    // What the plug-in answers is what lands on the goal, and a goal it did not
+    // answer for gets null rather than no field.
+    let mut goals = vec![
+        json!({"wpo": "g1", "stats": {"summary": " (Alt-Ergo 20ms) (Cached)"}}),
+        json!({"wpo": "g2", "stats": {"summary": " (Alt-Ergo 20ms) (Cached)"}}),
+        json!({"wpo": "g3"}),
+    ];
+    apply_cache_provenance(&mut goals, &json!({"result": {"goals": [
+        {"wpo": "g1", "best_result_cached": true},
+        {"wpo": "g2", "best_result_cached": false},
+    ], "unknown": ["g3"]}}));
+    assert_eq!(goal_is_from_cache(&goals[0]), Some(true));
+    assert_eq!(goal_is_from_cache(&goals[1]), Some(false));
+    assert_eq!(goal_is_from_cache(&goals[2]), None);
+    assert!(goals[2].get("from_cache").is_some(), "the field must be present and null");
+
+    // A run whose plug-in could not answer at all: every goal unknown.
+    let mut none = vec![json!({"wpo": "g1", "stats": {"summary": " (Alt-Ergo) (Cached)"}})];
+    apply_cache_provenance(&mut none, &serde_json::Value::Null);
+    assert_eq!(goal_is_from_cache(&none[0]), None);
 }
 
 /// Which marker `getMarkerAt` hands back follows the position, so the two

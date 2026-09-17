@@ -812,6 +812,42 @@ async fn run_e_acsl_can_instrument_injected_annotations() {
     let _ = client.cancel().await;
 }
 
+/// A prover list with one name this Frama-C does not offer is refused, naming
+/// it.
+///
+/// FRAMAC_PROVERS=alt-ergo,<absent> used to run on Alt-Ergo alone and report
+/// both provers as effective in effective_wp_config and the receipt, so the
+/// proof named a prover that never ran. The name here is one no Why3 detects,
+/// so the test does not depend on what this machine has installed.
+#[tokio::test]
+async fn framac_provers_with_an_unknown_name_is_refused_not_narrowed() {
+    let fixture = workspace_path("tests/fixtures/test_abs.c");
+    let client = spawn_mcp_client_with_env(
+        fixture.to_str().unwrap(),
+        &[("FRAMAC_PROVERS", "alt-ergo,no-such-prover")],
+    )
+    .await;
+
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+
+    assert_ne!(result["verdict"], "proved", "{result:?}");
+    let wp_not_run = result["incomplete"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["code"] == "WP_NOT_RUN"))
+        .unwrap_or_else(|| panic!("WP ran despite an unknown prover: {result:?}"));
+    assert!(
+        wp_not_run.to_string().contains("no-such-prover"),
+        "the refusal must name the prover: {wp_not_run}"
+    );
+
+    let _ = client.cancel().await;
+}
+
 /// `FRAMAC_PROVERS` must not stop WP running.
 ///
 /// `apply_wp_config` issued `plugins.wp.setProvers`, which 33.0 does not have.
@@ -1055,50 +1091,734 @@ async fn check_fails_closed_on_a_clause_eva_disproved() {
 /// `axiom bogus: \false;` then closes that goal along with everything else. WP
 /// assumes an axiom while proving the rest and never checks it, so the axiom
 /// has to be reported as the assumption it is.
+///
+/// Both scopes, as with the lemma above. A run scoped to one function used to
+/// answer "proved" here even after the whole-program run was fixed: the
+/// function filter exempted kind "lemma" from its scope test, and an axiom is
+/// kind "axiom" with no scope field, so it was filtered out of the property
+/// table the ASSUMED_VALID accounting reads.
 #[tokio::test]
 async fn check_reports_an_axiom_as_an_assumption() {
     let fixture = workspace_path("tests/fixtures/axiom-licensed.c");
-    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
 
-    // `detail: "full"` because the assertion below reads the goals themselves.
-    // The default summarises `wp_goals` into an object, and the point here is
-    // that every individual goal came back valid.
+    // One client per scope, for the reason given by
+    // check_fails_closed_on_an_undischarged_lemma: a second check in one
+    // session reloads and fails for another reason.
+    for scope in [None, Some("uncalled")] {
+        let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+
+        // Full detail, because the assertion below reads the goals themselves.
+        // The default summarises wp_goals into an object, and the point here is
+        // that every individual goal came back valid.
+        let mut args = json!({
+            "files": [fixture.to_str().unwrap()],
+            "timeout": 5,
+            "detail": "full",
+        });
+        if let Some(function) = scope {
+            args["function"] = json!(function);
+        }
+        let result = call_tool_json(&client, "check", args).await.unwrap();
+
+        assert_ne!(result["verdict"], "proved", "scope {scope:?}: {result:?}");
+        assert!(
+            result["incomplete"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["code"] == "ASSUMED_VALID"
+                        && item["descr"]
+                            .as_str()
+                            .is_some_and(|descr| descr.contains("bogus"))
+                })
+            }),
+            "scope {scope:?}: the axiom must be named: {result:?}"
+        );
+
+        // The axiom really is what closes the goal. Every WP goal in this file
+        // is valid, so without this report there is nothing left to fail on.
+        let goals = result["wp_goals"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert!(!goals.is_empty(), "scope {scope:?}: WP emitted no goal at all: {result:?}");
+        assert!(
+            goals
+                .iter()
+                .all(|goal| goal["normalized_status"] == "valid"),
+            "scope {scope:?}: a non-valid goal would carry this file on its own: {result:?}"
+        );
+
+        let _ = client.cancel().await;
+    }
+}
+
+/// A session leaves nothing in TMPDIR once it has shut down.
+///
+/// Frama-C removes its temporary files at exit, but this server ends it by
+/// killing its process group, so they stayed: measured, one check left the
+/// preprocessed sources and a machdep directory behind every time. Each
+/// Frama-C now gets its own TMPDIR that the server removes with the process.
+/// A sandbox is included, because its process is spawned separately.
+#[tokio::test]
+async fn a_session_leaves_nothing_in_tmpdir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fixture = workspace_path("tests/fixtures/smoke-vacuous.c");
+    let client = spawn_mcp_client_with_env(
+        fixture.to_str().unwrap(),
+        &[("TMPDIR", tmp.path().to_str().unwrap())],
+    )
+    .await;
+    call_tool_json(&client, "check", json!({"files": [fixture.to_str().unwrap()], "timeout": 2}))
+        .await
+        .unwrap();
+    let created = call_tool_json(&client, "create_sandbox", json!({"function": "fine", "experiment_id": "tmpdir"}))
+        .await
+        .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox name").to_string();
+    call_tool_json(&client, "run_wp", json!({"functions": [&sandbox], "timeout": 2}))
+        .await
+        .unwrap();
+    call_tool_json(&client, "delete_sandbox", json!({"sandbox_name": &sandbox}))
+        .await
+        .unwrap();
+    let _ = client.cancel().await;
+
+    // The server exits after the client goes away; give its shutdown a moment
+    // to kill the Frama-C group and drop the state that owns the directory.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let left = loop {
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("read tmpdir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().to_string()))
+            .collect();
+        if left.is_empty() || std::time::Instant::now() > deadline {
+            break left;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert!(left.is_empty(), "left in TMPDIR: {left:?}");
+}
+
+/// run_wp {prop} proves the properties it selects and no others.
+///
+/// It used to reach WP's -wp-prop setting only, which startProofs never reads
+/// for a declaration, so the main-instance run proved and reported every goal
+/// of the function. The receipt is the run's own evidence, so that is where the
+/// narrowing is asserted.
+#[tokio::test]
+async fn run_wp_prop_narrows_the_proved_goals() {
+    let fixture = workspace_path("tests/fixtures/prop-named-asserts.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    call_tool_json(&client, "reload_project", json!({"files": [fixture.to_str().unwrap()], "rte": true}))
+        .await
+        .unwrap();
+
+    // The receipt names goals by stable id rather than by WP name, so the
+    // narrowing is asserted on the ids: one for "two", and exactly the
+    // unfiltered set minus one for "-one".
+    let receipt_goals = |result: &Value| -> Vec<String> {
+        result["proof_receipt"]["goals"]
+            .as_array()
+            .map(|goals| {
+                goals
+                    .iter()
+                    .filter_map(|goal| goal["stable_goal_id"].as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let run = |prop: Option<&str>| {
+        let mut args = json!({"functions": ["f"], "timeout": 3});
+        if let Some(prop) = prop {
+            args["prop"] = json!(prop);
+        }
+        call_tool_json(&client, "run_wp", args)
+    };
+
+    let all = receipt_goals(&run(None).await.unwrap());
+    let two = receipt_goals(&run(Some("two")).await.unwrap());
+    let without_one = receipt_goals(&run(Some("-one")).await.unwrap());
+
+    assert!(all.len() > 3, "the unfiltered run proved too little to compare: {all:?}");
+    assert_eq!(two.len(), 1, "prop two: {two:?}");
+    assert!(all.contains(&two[0]), "prop two proved a goal the full run does not have: {two:?}");
+    assert_eq!(without_one.len(), all.len() - 1, "prop -one: {without_one:?} against {all:?}");
+    assert!(without_one.contains(&two[0]), "-one dropped assert two: {without_one:?}");
+
+    // retry_unproved re-fetches WP's whole goal table, so the narrowing has to
+    // survive the retry as well: it reported the excluded properties' goals
+    // until the filter moved inside retry_timed_out_goals.
+    let retried = receipt_goals(
+        &call_tool_json(&client, "run_wp", json!({
+            "functions": ["f"],
+            "timeout": 3,
+            "prop": "two",
+            "retry_unproved": true,
+            "cache": "None",
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(retried.len(), 1, "retry_unproved widened a narrowed run: {retried:?}");
+
+    let refused = raw_call(&client, "run_wp", json!({"functions": ["f"], "prop": "no_such_name"})).await;
+    assert!(
+        format!("{refused:?}").contains("selects no property"),
+        "a filter that selects nothing must be refused: {refused:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// The unsigned RTE options follow each load of one session, for EVA too.
+///
+/// They are kernel state on a long-lived Frama-C and are set at every load
+/// from that load's rte, because they decide EVA's alarms as well as WP's
+/// guards. Three checks in one server, alternating rte, show a later rte: false
+/// clearing what an earlier rte: true set, and the next rte: true setting it
+/// again.
+#[tokio::test]
+async fn unsigned_rte_options_follow_each_load_in_one_session() {
+    let fixture = workspace_path("tests/fixtures/rte-unsigned-eva.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    for rte in [true, false, true] {
+        let result = call_tool_json(&client, "check", json!({
+            "files": [fixture.to_str().unwrap()],
+            "timeout": 2,
+            "detail": "full",
+            "rte": rte,
+        }))
+        .await
+        .unwrap();
+        let unsigned_alarm = result["eva_alarms"]
+            .as_array()
+            .is_some_and(|alarms| alarms.iter().any(|alarm| alarm.to_string().contains("unsigned_overflow")));
+        assert_eq!(
+            unsigned_alarm, rte,
+            "rte {rte}: the unsigned alarm did not follow this load: {result:?}"
+        );
+    }
+    let _ = client.cancel().await;
+}
+
+/// Behavior-only assigns on a callee are reported as an assumed contract,
+/// whether or not WP prints a message for them.
+///
+/// acsl-skills gates on "using unguarded behavior assigns" and "using complete
+/// behaviors assigns". Measured here, the unguarded shape prints no message at
+/// all, so a message gate would miss it; ASSUMED_CALLEE_CONTRACT reads the
+/// call shape and covers both, which this pins.
+#[tokio::test]
+async fn behavior_only_assigns_are_an_assumed_callee_contract() {
+    let fixture = workspace_path("tests/fixtures/behavior-assigns-fallback.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
     let result = call_tool_json(&client, "check", json!({
         "files": [fixture.to_str().unwrap()],
+        "timeout": 2,
+    }))
+    .await
+    .unwrap();
+    assert_ne!(result["verdict"], "proved", "{result:?}");
+    for callee in ["set_unguarded", "set_complete"] {
+        assert!(
+            result["incomplete"].as_array().is_some_and(|items| items
+                .iter()
+                .any(|item| item["code"] == "ASSUMED_CALLEE_CONTRACT" && item["callee"] == callee)),
+            "{callee} is not reported as an assumed callee contract: {result:?}"
+        );
+    }
+    let _ = client.cancel().await;
+}
+
+/// check {smoke: true} reports a contradictory contract; plain check runs no
+/// smoke probe at all.
+///
+/// A requires no state satisfies proves every goal in its function, a false
+/// postcondition included, and nothing but WP's smoke tests notices. check used
+/// to have no way to ask for them, and run_wp {smoke, provers} counted the
+/// doomed goal among the proved ones with no field naming it.
+#[tokio::test]
+async fn check_smoke_reports_a_contradictory_requires() {
+    let fixture = workspace_path("tests/fixtures/smoke-vacuous.c");
+    for smoke in [true, false] {
+        let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+        let mut args = json!({"files": [fixture.to_str().unwrap()], "timeout": 5});
+        if smoke {
+            args["smoke"] = json!(true);
+        }
+        let result = call_tool_json(&client, "check", args).await.unwrap();
+        let smoke_codes: Vec<&Value> = result["incomplete"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["code"].as_str().is_some_and(|code| code.starts_with("SMOKE_")))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if smoke {
+            assert_eq!(smoke_codes.len(), 1, "{result:?}");
+            let entry = smoke_codes[0];
+            assert_eq!(entry["code"], "SMOKE_TEST_FAILED", "{result:?}");
+            let failed = entry["failed"].to_string();
+            assert!(failed.contains("impossible"), "the doomed goal is not named: {entry}");
+            assert!(!failed.contains("fine"), "a satisfiable requires was reported: {entry}");
+            assert_eq!(result["wp"]["smoke_probe"]["ran"], true, "{result:?}");
+        } else {
+            assert!(smoke_codes.is_empty(), "smoke was not asked for: {result:?}");
+            assert!(result["wp"].get("smoke_probe").is_none(), "a probe ran unasked: {result:?}");
+        }
+        let _ = client.cancel().await;
+    }
+}
+
+/// run_wp {smoke: true} tests the AST this session holds, not the file on disk.
+///
+/// The isolated route that smoke plus provers selects proves the files on disk,
+/// so a requires injected in a sandbox was invisible to it. The smoke probe
+/// runs over the printed AST, and a contradiction injected here is what it
+/// must find.
+#[tokio::test]
+async fn run_wp_smoke_sees_an_injected_contradiction() {
+    let fixture = workspace_path("tests/fixtures/smoke-vacuous.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    call_tool_json(&client, "reload_project", json!({"files": [fixture.to_str().unwrap()]}))
+        .await
+        .unwrap();
+    let created = call_tool_json(&client, "create_sandbox", json!({
+        "function": "fine",
+        "experiment_id": "smoke",
+    }))
+    .await
+    .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox name").to_string();
+
+    let prove = || {
+        call_tool_json(&client, "run_wp", json!({"functions": [&sandbox], "timeout": 5, "smoke": true}))
+    };
+    let before = prove().await.unwrap();
+    assert_eq!(before["smoke_probe"]["ran"], true, "{before:?}");
+    assert_eq!(before["smoke_probe"]["failed"], json!([]), "fine is not vacuous: {before:?}");
+
+    call_tool_json(&client, "inject_all_annotations", json!({
+        "sandbox_name": &sandbox,
+        "annotations": [{"kind": "requires", "acsl": "n < 0"}],
+    }))
+    .await
+    .unwrap();
+    let after = prove().await.unwrap();
+    assert_eq!(after["smoke_probe"]["ran"], true, "{after:?}");
+    assert!(
+        after["smoke_probe"]["failed"].as_array().is_some_and(|failed| !failed.is_empty()),
+        "the injected contradiction was not tested: {after:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A scoped check does not leave its entry point behind for the next call.
+///
+/// The kernel's -main is sticky and reload_files_in_place does not respawn
+/// when the files and options are unchanged, so a value written for one call
+/// reached the next. A check that asks for EVA alone never reaches
+/// check_wp_step, which is where the reset used to live, so that path left
+/// -main at the scoped function: measured before the fix, the second call came
+/// back incomplete with 4 goals and WP_VERIFICATION_SKIPPED where the same
+/// call alone is proved with 6. run_eva_payload sets the entry point on every
+/// run now, defaulting to "main", so the value is a function of the call
+/// rather than a residue of the last one.
+#[tokio::test]
+async fn a_scoped_check_does_not_leak_its_entry_point() {
+    let fixture = workspace_path("tests/fixtures/entry-point-leak.c");
+    let file = fixture.to_str().unwrap();
+    let goals = |result: &Value| -> Option<u64> {
+        result["wp"]["measurement"]["goals"].as_u64()
+    };
+
+    let client = spawn_mcp_client("").await;
+    let alone = call_tool_json(&client, "check", json!({"files": [file], "timeout": 5}))
+        .await
+        .unwrap();
+    assert_eq!(alone["verdict"], "proved", "the fixture no longer proves on its own: {alone:?}");
+    let expected = goals(&alone);
+    let _ = client.cancel().await;
+
+    // The same call, after a scoped check that runs EVA and never reaches the
+    // WP step where the reset lives.
+    let client = spawn_mcp_client("").await;
+    call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "g",
+        "want": ["eva"],
         "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    let after = call_tool_json(&client, "check", json!({"files": [file], "timeout": 5}))
+        .await
+        .unwrap();
+    assert_eq!(goals(&after), expected, "the scoped call changed what the next one analysed: {after:?}");
+    assert_eq!(after["verdict"], "proved", "a stale entry point reached the next check: {after:?}");
+    let _ = client.cancel().await;
+
+    // And the case the two calls above cannot see. Both of them run EVA, which
+    // is where the entry point is written, so a reset living only there looks
+    // like it works: the second call puts the value back on its way past. A
+    // call that asks for WP alone never goes that way, and the stale value
+    // survived into it. Measured before the reset moved: 4 goals and
+    // WP_VERIFICATION_SKIPPED, WP having refused "g" as a recursive entry
+    // point, where this asserts the run is clean.
+    let client = spawn_mcp_client("").await;
+    call_tool_json(&client, "check", json!({
+        "files": [file],
+        "function": "g",
+        "want": ["eva"],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    let wp_only = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "want": ["wp"],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    let codes: Vec<&str> = wp_only["incomplete"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|item| item["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !codes.contains(&"WP_VERIFICATION_SKIPPED"),
+        "a stale entry point made WP refuse the function: {wp_only:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// Smoke tests reach the isolated CLI route, which plural provers select.
+///
+/// check asks for smoke through smoke_probe and forwards the caller's provers,
+/// which sends the run down that route; its gates read params.smoke alone, saw
+/// None, and passed no -wp-smoke-tests. The call then reported
+/// SMOKE_TEST_UNCHECKED with "WP did not complete", which was false: WP
+/// completed and the route ignored the request.
+#[tokio::test]
+async fn smoke_tests_reach_the_isolated_prover_route() {
+    let fixture = workspace_path("tests/fixtures/smoke-vacuous.c");
+    let client = spawn_mcp_client("").await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "smoke": true,
+        "provers": ["alt-ergo"],
+        "timeout": 10,
+    }))
+    .await
+    .unwrap();
+
+    let codes: Vec<&str> = result["incomplete"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|item| item["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        codes.contains(&"SMOKE_TEST_FAILED"),
+        "the vacuous contract was not reported on the isolated route: {result:?}"
+    );
+
+    // Reported through the same field the socket route publishes, so the gate
+    // reads one shape whichever route ran.
+    let probe = &result["wp"]["smoke_probe"];
+    assert_eq!(probe["ran"], json!(true), "{result:?}");
+    assert!(
+        probe["failed"]
+            .as_array()
+            .is_some_and(|failed| failed.iter().any(|name| {
+                name.as_str().is_some_and(|name| name.contains("wp_smoke"))
+            })),
+        "the probe named no doomed goal: {result:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// The message-derived gates reach the isolated prover route too.
+///
+/// Plural provers send a run down the isolated CLI route, which never touches
+/// the socket the message drain reads. Measured before this was bridged:
+/// check{provers} on this fixture reported no GENERATED_CALLEE_SPEC while the
+/// same file without provers reported it, so the gate that catches a proof
+/// resting on a contract nobody wrote was off for every caller who named a
+/// prover.
+#[tokio::test]
+async fn message_gates_reach_the_isolated_prover_route() {
+    let fixture = workspace_path("tests/fixtures/generated-callee-spec.c");
+    let file = fixture.to_str().unwrap();
+    let codes = |result: &Value| -> Vec<String> {
+        result["incomplete"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["code"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let client = spawn_mcp_client("").await;
+    let socket_route = call_tool_json(&client, "check", json!({"files": [file], "timeout": 10}))
+        .await
+        .unwrap();
+    assert!(
+        codes(&socket_route).contains(&"GENERATED_CALLEE_SPEC".to_string()),
+        "the fixture no longer has an invented callee contract: {socket_route:?}"
+    );
+    let _ = client.cancel().await;
+
+    let client = spawn_mcp_client("").await;
+    let isolated = call_tool_json(&client, "check", json!({
+        "files": [file],
+        "provers": ["alt-ergo"],
+        "timeout": 10,
+    }))
+    .await
+    .unwrap();
+    assert!(
+        codes(&isolated).contains(&"GENERATED_CALLEE_SPEC".to_string()),
+        "naming a prover switched the gate off: {isolated:?}"
+    );
+    let _ = client.cancel().await;
+}
+
+/// A check narrowed by prop says so, and cannot come back proved.
+///
+/// WP generates goals only for the selected properties, so the ones it skipped
+/// cannot surface as GOAL_NOT_VALID the way they do in a full run. Measured on
+/// this fixture: without prop the check is incomplete because "hard" will not
+/// discharge, and with prop: "easy" it reported proved off zero goals, having
+/// attempted nothing. The verdict rule is that proved means an empty
+/// incomplete[], so the narrowing has to appear there.
+#[tokio::test]
+async fn a_check_narrowed_by_prop_is_never_proved() {
+    let fixture = workspace_path("tests/fixtures/check-prop-narrowed.c");
+    let codes = |result: &Value| -> Vec<String> {
+        result["incomplete"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["code"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // A client each, because the fixture is checked twice and the two calls
+    // must not share a project.
+    let client = spawn_mcp_client("").await;
+    let full = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    assert_ne!(full["verdict"], "proved", "the fixture no longer has an unprovable property: {full:?}");
+    assert!(
+        !codes(&full).contains(&"CHECK_NARROWED_BY_PROP".to_string()),
+        "an unnarrowed check claimed it was narrowed: {full:?}"
+    );
+    let _ = client.cancel().await;
+
+    let client = spawn_mcp_client("").await;
+    let narrowed = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "prop": "easy",
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+    assert!(
+        codes(&narrowed).contains(&"CHECK_NARROWED_BY_PROP".to_string()),
+        "a narrowed check did not report the filter: {narrowed:?}"
+    );
+    assert_ne!(narrowed["verdict"], "proved", "a narrowed check reported proved: {narrowed:?}");
+    let _ = client.cancel().await;
+}
+
+/// rte: true checks unsigned wraparound and narrowing, and rte: false checks
+/// neither.
+///
+/// Frama-C 33 defaults both kernel options to off, so a load with rte: true
+/// generated no goal for "a - b" on unsigned operands and check reported the
+/// function proved. The options also decide EVA's alarms, so they are set per
+/// load rather than per WP run, and the command line records them.
+#[tokio::test]
+async fn rte_checks_unsigned_arithmetic() {
+    let fixture = workspace_path("tests/fixtures/rte-unsigned.c");
+
+    // (rte, rte_unsigned): checked, off altogether, and on without the unsigned
+    // checks, which must say so under RTE_REDUCED.
+    for (rte, rte_unsigned) in [(true, None), (false, None), (true, Some(false))] {
+        let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+        let mut args = json!({
+            "files": [fixture.to_str().unwrap()],
+            "timeout": 2,
+            "detail": "full",
+            "rte": rte,
+        });
+        if let Some(rte_unsigned) = rte_unsigned {
+            args["rte_unsigned"] = json!(rte_unsigned);
+        }
+        let result = call_tool_json(&client, "check", args).await.unwrap();
+
+        let goal_names: Vec<&str> = result["wp_goals"]
+            .as_array()
+            .map(|goals| goals.iter().filter_map(|goal| goal["wpo"].as_str()).collect())
+            .unwrap_or_default();
+        let unsigned_goals = |kind: &str| goal_names.iter().filter(|name| name.contains(kind)).count();
+        let options = result["wp"]["frama_c_options"].to_string();
+        let reduced = result["incomplete"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["code"] == "RTE_REDUCED"));
+
+        match (rte, rte_unsigned) {
+            (true, None) => {
+                assert!(unsigned_goals("rte_unsigned_overflow") > 0, "no overflow goal: {goal_names:?}");
+                assert!(unsigned_goals("rte_unsigned_downcast") > 0, "no downcast goal: {goal_names:?}");
+                assert!(
+                    options.contains("-warn-unsigned-overflow") && options.contains("-warn-unsigned-downcast"),
+                    "the options are not recorded: {options}"
+                );
+                assert_ne!(result["verdict"], "proved", "{result:?}");
+                assert!(!reduced, "a full rte load reported RTE_REDUCED: {result:?}");
+            }
+            (false, _) => {
+                assert_eq!(unsigned_goals("rte_unsigned"), 0, "rte false still checked: {goal_names:?}");
+                assert!(!reduced, "RTE_DISABLED covers an rte false load: {result:?}");
+            }
+            (true, Some(false)) => {
+                assert_eq!(unsigned_goals("rte_unsigned"), 0, "rte_unsigned false still checked: {goal_names:?}");
+                assert!(!options.contains("-warn-unsigned"), "the options were recorded anyway: {options}");
+                assert!(reduced, "the reduction was not reported: {result:?}");
+            }
+            _ => unreachable!(),
+        }
+        let _ = client.cancel().await;
+    }
+}
+
+/// check scoped to a function that has callers proves that function.
+///
+/// The entry point check sets for EVA used to stay set for WP, which refused a
+/// called function as a recursive entry point and generated no goal for its
+/// false postcondition; check said proved. It also turned a scoped function's
+/// own requires into a goal nothing could discharge. check restores the entry
+/// point before WP, so the postcondition is proved or refuted on its merits.
+#[tokio::test]
+async fn a_scoped_check_proves_a_function_that_has_callers() {
+    let fixture = workspace_path("tests/fixtures/wp-focus-with-caller.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [fixture.to_str().unwrap()],
+        "function": "f",
+        "timeout": 2,
         "detail": "full",
     }))
     .await
     .unwrap();
 
     assert_ne!(result["verdict"], "proved", "{result:?}");
-    assert!(
-        result["incomplete"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["code"] == "ASSUMED_VALID"
-                    && item["descr"]
-                        .as_str()
-                        .is_some_and(|descr| descr.contains("bogus"))
-            })
-        }),
-        "the axiom must be named: {result:?}"
-    );
-
-    // The axiom really is what closes the goal. Every WP goal in this file is
-    // valid, so without this report there is nothing left to fail on.
-    let goals = result["wp_goals"]
+    let codes: Vec<&str> = result["incomplete"]
         .as_array()
-        .map(Vec::as_slice)
+        .map(|items| items.iter().filter_map(|item| item["code"].as_str()).collect())
         .unwrap_or_default();
-    assert!(!goals.is_empty(), "WP emitted no goal at all: {result:?}");
+    assert!(!codes.contains(&"WP_VERIFICATION_SKIPPED"), "WP still refused f: {result:?}");
+    let ensures = result["wp_goals"]
+        .as_array()
+        .and_then(|goals| goals.iter().find(|goal| goal["wpo"].as_str().is_some_and(|name| name.ends_with("_f_ensures"))))
+        .unwrap_or_else(|| panic!("no goal for f's postcondition: {result:?}"));
+    assert_ne!(ensures["normalized_status"], "valid", "the false postcondition proved: {result:?}");
     assert!(
-        goals
-            .iter()
-            .all(|goal| goal["normalized_status"] == "valid"),
-        "a non-valid goal would carry this file on its own: {result:?}"
+        result["wp_goals"]
+            .as_array()
+            .is_some_and(|goals| goals.iter().all(|goal| !goal["wpo"].as_str().unwrap_or_default().ends_with("_f_requires"))),
+        "f's own requires became a goal: {result:?}"
     );
-
     let _ = client.cancel().await;
+}
+
+/// WP messages that mean part of a check was skipped, dropped, or encoded
+/// unsoundly block the verdict, each under its own code.
+///
+/// Before these codes every fixture below came back "proved" with nothing in
+/// incomplete[] (measured on Frama-C 33.0), the only evidence sitting in
+/// messages[]: a dropped statement contract and statement invariant, a false
+/// union property and a false frame property over undefined logic that WP
+/// proved, a scoped run that generated no goal for a false postcondition, and
+/// a caller proved against a callee contract the kernel invented.
+#[tokio::test]
+async fn wp_messages_that_void_a_proof_block_the_verdict() {
+    let cases: [(&str, Option<&str>, &str, &[&str]); 4] = [
+        (
+            "wp-annotation-skipped.c",
+            None,
+            "WP_ANNOTATION_SKIPPED",
+            &["Statement specifications", "Generalized invariant"],
+        ),
+        (
+            "wp-unsound-encoding.c",
+            None,
+            "WP_UNSOUND_ENCODING",
+            &["might be unsound", "interpreted as reads nothing"],
+        ),
+        (
+            "wp-non-natural-loop.c",
+            None,
+            "WP_VERIFICATION_SKIPPED",
+            &["Non-natural loop"],
+        ),
+        (
+            "generated-callee-spec.c",
+            None,
+            "GENERATED_CALLEE_SPEC",
+            &["function unspecified"],
+        ),
+    ];
+    for (file, function, code, reasons) in cases {
+        let fixture = workspace_path(&format!("tests/fixtures/{file}"));
+        let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+        let mut args = json!({"files": [fixture.to_str().unwrap()], "timeout": 5});
+        if let Some(function) = function {
+            args["function"] = json!(function);
+        }
+        let result = call_tool_json(&client, "check", args).await.unwrap();
+
+        assert_ne!(result["verdict"], "proved", "{file}: {result:?}");
+        let entries: Vec<&Value> = result["incomplete"]
+            .as_array()
+            .map(|items| items.iter().filter(|item| item["code"] == code).collect())
+            .unwrap_or_default();
+        for reason in reasons {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["reason"].as_str().is_some_and(|text| text.contains(reason))),
+                "{file}: no {code} entry mentioning {reason:?}: {result:?}"
+            );
+        }
+        assert!(
+            !result["incomplete_guidance"][code].is_null(),
+            "{file}: {code} carries no guidance: {result:?}"
+        );
+
+        // The callee the user wrote a contract for is not reported: only the
+        // wholly invented contract is.
+        if code == "GENERATED_CALLEE_SPEC" {
+            assert!(
+                entries.iter().all(|entry| !entry["reason"].to_string().contains("function specified")),
+                "a callee with its own assigns was reported: {result:?}"
+            );
+        }
+        let _ = client.cancel().await;
+    }
 }
 
 /// An `axiomatic` block injects, and its axioms are owned rather than hidden.
@@ -1425,54 +2145,81 @@ async fn context_marker_at_reports_no_function_for_a_global() {
     let _ = client.cancel().await;
 }
 
-/// A verdict replayed from WP's cache says so.
+/// A verdict replayed from WP's cache says so, and one computed here says that.
 ///
-/// `-wp-cache` defaults to `update`, so WP has always been reusing verdicts
-/// from previous runs and nothing in the payload said which. That matters for
-/// the proof receipt, whose claim is that two runs with matching receipts are
+/// The -wp-cache option defaults to "update", so WP reuses verdicts from
+/// earlier runs and the payload has to say which. That matters for the proof
+/// receipt, whose claim is that two runs with matching receipts are
 /// comparable: a replayed verdict is a real proof of that VC by that prover,
-/// but not one this run performed. `from_cache` records the difference, and
-/// `cache: "None"` is how a caller insists on proving it here and now, which
-/// is what the tutorial corpus gate does with `-wp-cache none`.
+/// but not one this run performed.
+///
+/// Two sessions over one cache directory, because that is when a replay
+/// happens: WP does not re-prove a goal that is already valid, so a second run
+/// in the same process replays nothing however full the cache is. The first
+/// session's Rebuild fills the cache and must report nothing replayed, which is
+/// what the old version of this test could not assert: from_cache was read
+/// off the word "(Cached)" in WP's summary, printed for every cacheable goal in
+/// any updating mode, so a Rebuild that replays nothing reported every
+/// prover-discharged goal as replayed.
 #[tokio::test]
 async fn a_replayed_wp_verdict_is_reported_as_one() {
     let fixture = workspace_path("tests/fixtures/tutorial/bsearch.c");
-    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    let cache = tempfile::tempdir().expect("cache dir");
+    let counts = |goals: &Value| -> (usize, usize, usize) {
+        let goals = goals.as_array().expect("goal array");
+        (
+            goals.iter().filter(|goal| goal["from_cache"] == true).count(),
+            goals.iter().filter(|goal| goal["from_cache"] == false).count(),
+            goals.iter().filter(|goal| goal["from_cache"].is_null()).count(),
+        )
+    };
 
-    // Fill the cache first. `Rebuild` always runs the provers and writes what
-    // it proves, so the replay below is this test's doing rather than whatever
-    // an earlier run happened to leave on disk.
-    call_tool_json(&client, "run_wp", json!({"timeout": 5, "cache": "Rebuild"}))
+    // First session: fill the cache. Rebuild runs every prover and writes what
+    // it proves, so nothing here is a replay.
+    let filling = spawn_mcp_client_with_env(
+        fixture.to_str().unwrap(),
+        &[("FRAMAC_WP_CACHEDIR", cache.path().to_str().unwrap())],
+    )
+    .await;
+    call_tool_json(&filling, "run_wp", json!({"timeout": 10, "cache": "Rebuild"}))
         .await
         .unwrap();
+    let rebuilt = call_tool_json(&filling, "get_wp_goals", json!({})).await.unwrap();
+    let (replayed, computed, unknown) = counts(&rebuilt);
+    assert!(computed > 0, "Rebuild proved nothing: {rebuilt:?}");
+    assert_eq!(replayed, 0, "Rebuild replayed a verdict: {rebuilt:?}");
+    assert_eq!(unknown, 0, "the plug-in did not answer: {rebuilt:?}");
+    let _ = filling.cancel().await;
 
-    // With the cache off, nothing is replayed however full it is.
-    call_tool_json(&client, "run_wp", json!({"timeout": 5, "cache": "None"}))
+    // Second session, same cache: Update replays what the first stored.
+    let client = spawn_mcp_client_with_env(
+        fixture.to_str().unwrap(),
+        &[("FRAMAC_WP_CACHEDIR", cache.path().to_str().unwrap())],
+    )
+    .await;
+    call_tool_json(&client, "run_wp", json!({"timeout": 10, "cache": "Update"}))
         .await
         .unwrap();
-    let fresh = call_tool_json(&client, "get_wp_goals", json!({}))
-        .await
-        .unwrap();
-    let fresh = fresh.as_array().expect("goal array");
-    assert!(!fresh.is_empty(), "{fresh:?}");
+    let replayed_goals = call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap();
     assert!(
-        fresh.iter().all(|goal| goal["from_cache"] == false),
-        "cache None means every verdict was computed here: {fresh:?}"
+        counts(&replayed_goals).0 > 0,
+        "a prover-discharged goal must come back replayed: {replayed_goals:?}"
     );
 
-    // Now let it replay. At least one prover-discharged goal comes back marked,
-    // per goal rather than buried in a free-form summary string.
-    call_tool_json(&client, "run_wp", json!({"timeout": 5, "cache": "Update"}))
+    // A third session, same warm cache, proving with the cache off: nothing is
+    // replayed however full it is. Its own session for the reason above, since
+    // the run before it left every goal valid.
+    let off = spawn_mcp_client_with_env(
+        fixture.to_str().unwrap(),
+        &[("FRAMAC_WP_CACHEDIR", cache.path().to_str().unwrap())],
+    )
+    .await;
+    call_tool_json(&off, "run_wp", json!({"timeout": 10, "cache": "None"}))
         .await
         .unwrap();
-    let replayed = call_tool_json(&client, "get_wp_goals", json!({}))
-        .await
-        .unwrap();
-    let replayed = replayed.as_array().expect("goal array");
-    assert!(
-        replayed.iter().any(|goal| goal["from_cache"] == true),
-        "a prover-discharged goal must come back replayed: {replayed:?}"
-    );
+    let fresh = call_tool_json(&off, "get_wp_goals", json!({})).await.unwrap();
+    assert_eq!(counts(&fresh).0, 0, "cache None replayed a verdict: {fresh:?}");
+    let _ = off.cancel().await;
 
     // The mode does not linger. WP settings are process state, so a run that
     // names none has to be put back to the default rather than inheriting the
@@ -1576,6 +2323,78 @@ async fn run_wp_generates_rte_guards_without_a_reload() {
     let _ = client.cancel().await;
 }
 
+/// In-place RTE generation follows the load's unsigned setting rather than
+/// raising it, and reports the coverage it actually has.
+///
+/// Unsigned wraparound is defined behaviour in C, so the two unsigned checks
+/// are an opt-in beyond undefined behaviour and the load decides them, for EVA
+/// and WP alike. Turning them on here instead would make one check disagree
+/// with the next in a single session, which is the bug the setters in
+/// reload_project were moved to answer.
+#[tokio::test]
+async fn run_wp_in_place_rte_follows_the_loads_unsigned_setting() {
+    let fixture = workspace_path("tests/fixtures/rte-unsigned.c");
+    let client = spawn_mcp_client("").await;
+    call_tool_json(&client, "reload_project", json!({
+        "files": [fixture.to_str().unwrap()],
+        "rte": false,
+    }))
+    .await
+    .unwrap();
+
+    let run = call_tool_json(&client, "run_wp", json!({
+        "functions": ["sub", "narrow"],
+        "timeout": 5,
+    }))
+    .await
+    .unwrap();
+
+    // The guards were generated in place, which is what distinguishes this from
+    // the load-time path: run_wp ran generateRTEGuards on both targets.
+    let guarded = run["rte_guarded_in_place"].as_array().expect("rte_guarded_in_place");
+    let guarded: Vec<&str> = guarded.iter().filter_map(|name| name.as_str()).collect();
+    assert!(guarded.contains(&"sub") && guarded.contains(&"narrow"), "guards were not generated: {run:?}");
+
+    // Generated, and still without the unsigned obligations the load declined.
+    assert!(
+        !run["frama_c_options"].to_string().contains("-warn-unsigned"),
+        "an rte false load was reported as covering unsigned checks: {run:?}"
+    );
+
+    // Including the probe's own command line, which is a separate frama-c run
+    // and so a separate chance to claim coverage the session does not have.
+    assert!(
+        !run["memory_model_probe"]["command"].to_string().contains("-warn-unsigned"),
+        "the probe ran with unsigned checks the session lacks: {run:?}"
+    );
+
+    let goals = call_tool_json(&client, "get_wp_goals", json!({})).await.unwrap();
+    let goals = goals.as_array().expect("goal array");
+    let unsigned: Vec<&str> = goals
+        .iter()
+        .filter_map(|goal| goal["wpo"].as_str())
+        .filter(|wpo| wpo.contains("rte_unsigned"))
+        .collect();
+    assert!(unsigned.is_empty(), "in-place guards raised the load's unsigned setting: {unsigned:?}");
+    let _ = client.cancel().await;
+}
+
+/// A prop filter may name a global axiom, which WP assumes for every target.
+#[tokio::test]
+async fn run_wp_prop_filter_includes_global_axioms() {
+    let fixture = workspace_path("tests/fixtures/axiom-licensed.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+    let run = call_tool_json(&client, "run_wp", json!({
+        "prop": "bogus",
+        "timeout": 5,
+    }))
+    .await
+    .expect("global axiom was rejected by prop selection");
+    assert_eq!(run["effective_wp_config"]["prop"]["effective"], "bogus", "global axiom was silently omitted: {run:?}");
+    assert_eq!(run["effective_wp_config"]["prop"]["effective_known"], true, "global axiom selection was not recorded: {run:?}");
+    let _ = client.cancel().await;
+}
+
 /// `get_wp_goals {since}` says what changed, not what exists.
 ///
 /// The join is on `stable_goal_id`, so it only means anything if those ids
@@ -1668,9 +2487,9 @@ async fn wp_goals_diff_against_an_earlier_run() {
 
     // The set moved and the delta is still a number, which is the whole point
     // of measuring it over the goals both runs hold: the assertion's own goal
-    // is reported under "appeared" and stays out of the denominator, so the
-    // one obligation that went from open to discharged is exactly what the
-    // fraction moves by.
+    // is reported under "appeared" and stays out of the denominator, so the one
+    // obligation that went from open to discharged is exactly what the fraction
+    // moves by.
     assert_eq!(
         diff["progress"]["shared_total"].as_u64(),
         before_progress["total"].as_u64(),
@@ -1734,6 +2553,43 @@ async fn wp_goals_diff_against_an_earlier_run() {
     .expect_err("an unknown receipt must be refused");
     assert!(unknown.contains("this session"), "{unknown}");
 
+    let _ = client.cancel().await;
+}
+
+/// A sandbox's command-line probes carry the unsigned checks its process has.
+///
+/// The sandbox process always runs with -rte and both unsigned switches, but
+/// its probes were built from a default load, whose rte is false, so they ran
+/// without the unsigned options and described a session with fewer
+/// obligations than the one they sat beside.
+#[tokio::test]
+async fn sandbox_probes_keep_the_sandbox_unsigned_checks() {
+    let fixture = workspace_path("tests/fixtures/rte-unsigned.c");
+    let client = spawn_mcp_client(fixture.to_str().unwrap()).await;
+
+    let created = call_tool_json(&client, "create_sandbox", json!({
+        "function": "sub",
+        "experiment_id": unique_experiment_id("unsigned"),
+    }))
+    .await
+    .unwrap();
+    let sandbox = created["sandbox_name"].as_str().expect("sandbox name").to_string();
+
+    let run = call_tool_json(&client, "run_wp", json!({
+        "functions": [&sandbox],
+        "timeout": 5,
+        "smoke": true,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(run["effective_wp_config"]["scope"], "sandbox", "{run:?}");
+    for probe in ["memory_model_probe", "smoke_probe"] {
+        let command = run[probe]["command"].to_string();
+        assert!(
+            command.contains("-warn-unsigned-overflow") && command.contains("-warn-unsigned-downcast"),
+            "the sandbox {probe} ran without the unsigned checks: {run:?}"
+        );
+    }
     let _ = client.cancel().await;
 }
 
@@ -4800,20 +5656,30 @@ async fn check_receipts_distinguish_eva_entry_points() {
     let _ = client.cancel().await;
 }
 
-/// The receipt a real run produced, named by its hash, is accepted as evidence.
+/// The receipt a real run produced, named by its hash, resolves to its bytes.
 ///
 /// The unit test for this covers SessionState alone. What it cannot show is the
-/// path a caller actually takes: run_wp, read sha256 off the receipt, hand that
-/// string back. Every other conclusion test here builds a synthetic receipt
-/// with fixture_receipt, so the real run_wp-to-store path had no coverage in
-/// either direction.
+/// path a caller actually takes: run a proof, read sha256 off the receipt, hand
+/// that string back. Every other conclusion test here builds a synthetic
+/// receipt with fixture_receipt, so the real run-to-store path had no coverage
+/// in either direction.
 ///
 /// The hash exists because the object cannot practically be echoed: acceptance
 /// recomputes the digest over the receipt's serialized bytes, and one
 /// function's receipt is roughly 8 KB whose bulk is a goal array. Resolving the
 /// hash checks the same bytes, since they are the ones this process wrote.
+///
+/// It took its receipt from run_wp until 2026-09-17, and asserted that such a
+/// receipt is evidence. It is not: the soundness gates run in check, and a
+/// run_wp receipt records no verdict, so an invented callee contract, a skipped
+/// function or annotation, an unsound encoding and a failed smoke test are all
+/// invisible to it. Measured on generated-callee-spec.c, that receipt stored as
+/// verified and proof_coverage then answered "complete" at 100% for a program
+/// whose proof rests on a contract nobody wrote. The hash path is the subject
+/// here and is unchanged; only the receipt it carries had to become one that
+/// can be evidence, and the run_wp half is asserted below as a refusal.
 #[tokio::test]
-async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
+async fn a_receipt_hash_from_a_check_is_accepted_as_evidence() {
     // A fixture that proves clean, because a verified conclusion is also
     // checked against its summary: storing one whose goals are not all valid is
     // refused on that ground before the receipt is ever consulted, which would
@@ -4821,12 +5687,20 @@ async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
     let c_file = workspace_path("tests/fixtures/abs-int-fixed.c");
     let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
 
-    let run = call_tool_json(&client, "run_wp", json!({"timeout": 5}))
-        .await
-        .unwrap();
+    // Named explicitly: a check that does not say which files it is about
+    // writes a receipt with no usable source list, and the evidence gate
+    // refuses that before it ever reaches the verdict this test is here for.
+    let run = call_tool_json(&client, "check", json!({
+        "files": [c_file.to_str().unwrap()],
+        "timeout": 10,
+        "detail": "full",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(run["verdict"], "proved", "the fixture no longer proves clean: {run:?}");
     let sha = run["proof_receipt"]["sha256"]
         .as_str()
-        .expect("run_wp returns a receipt with a sha256")
+        .expect("check returns a receipt with a sha256")
         .to_string();
 
     // Derived from the run, not invented: storing a conclusion also checks the
@@ -4874,6 +5748,36 @@ async fn a_receipt_hash_from_run_wp_is_accepted_as_evidence() {
     assert!(
         text.contains("frama-c-mcp.proof-receipt"),
         "and it must be the receipt object, not the bare hash: {text}"
+    );
+
+    // The other direction, on the same session and the same clean fixture, so
+    // the only thing that differs is which tool produced the receipt. run_wp
+    // proves the same goals and records no verdict, and a conclusion cannot
+    // rest on it however green its goals are.
+    let bare_run = call_tool_json(&client, "run_wp", json!({"timeout": 5}))
+        .await
+        .unwrap();
+    let bare_sha = bare_run["proof_receipt"]["sha256"]
+        .as_str()
+        .expect("run_wp returns a receipt with a sha256")
+        .to_string();
+    let refused = call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({
+            "function": "abs_int",
+            "status": "verified",
+            "wp_summary": {
+                "total": total, "valid": valid,
+                "unknown": total - valid, "timeout": 0, "failed": 0
+            },
+            "proof_receipt_sha256": bare_sha,
+        }),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a run_wp receipt was accepted as verified evidence: {refused:?}"
     );
 
     // And coverage counts it. This is the whole claim of proof_coverage and
@@ -4948,8 +5852,13 @@ async fn two_identical_runs_produce_one_receipt() {
     // them, so an identical second check saw the same alarm under a new marker
     // and those markers were hashed. incomplete_digest strips them and sorts.
     let c_file = workspace_path("tests/fixtures/test_comprehensive.c");
+    // Keep this test's proof cache private. The two processes below are then
+    // an explicit fresh/replayed pair: the first fills it and the second reads
+    // it, independently of test order or another test's cache entries.
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cache_env = [("FRAMAC_WP_CACHEDIR", cache.path().to_str().unwrap())];
 
-    let first_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let first_client = spawn_mcp_client_with_env(c_file.to_str().unwrap(), &cache_env).await;
     let first = call_tool_json(&first_client, "check", json!({}))
         .await
         .unwrap();
@@ -4958,17 +5867,56 @@ async fn two_identical_runs_produce_one_receipt() {
         .unwrap();
     let _ = first_client.cancel().await;
 
-    let second_client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+    let second_client = spawn_mcp_client_with_env(c_file.to_str().unwrap(), &cache_env).await;
     let second = call_tool_json(&second_client, "check", json!({}))
         .await
         .unwrap();
     let _ = second_client.cancel().await;
 
-    // Same server, second call. The markers differ between these two and the
-    // receipt must not.
+    // Cache provenance is proof evidence, not a session-scoped marker: a
+    // fresh proof and a replayed proof deliberately have different receipts.
+    // Strip only that field (and the hash over it) while testing the remaining
+    // determinism guarantees below.
+    let without_cache_provenance = |receipt: &serde_json::Value| {
+        let mut normalized = receipt.clone();
+        normalized.as_object_mut().unwrap().remove("sha256");
+        for goal in normalized["goals"].as_array_mut().into_iter().flatten() {
+            goal.as_object_mut().unwrap().remove("from_cache");
+        }
+        normalized
+    };
     assert_eq!(
-        first["proof_receipt"]["sha256"], repeated["proof_receipt"]["sha256"],
-        "a repeated check on one server produced a different receipt"
+        without_cache_provenance(&first["proof_receipt"]),
+        without_cache_provenance(&repeated["proof_receipt"]),
+        "a repeated check changed receipt evidence other than cache provenance"
+    );
+
+    // This is deliberately a fresh/replayed pair, rather than merely a
+    // normalization check. Cache provenance belongs in receipt identity:
+    // consumers must distinguish work performed for this run from a valid
+    // verdict WP replayed.
+    let first_goals = first["proof_receipt"]["goals"]
+        .as_array()
+        .expect("first proof receipt has goals");
+    let second_goals = second["proof_receipt"]["goals"]
+        .as_array()
+        .expect("replayed proof receipt has goals");
+    assert!(
+        first_goals.iter().any(|goal| goal["from_cache"] == false),
+        "the fresh check did not compute a prover verdict: {first:?}"
+    );
+    assert!(
+        second_goals.iter().any(|goal| goal["from_cache"] == true),
+        "the second process did not replay a cached prover verdict: {second:?}"
+    );
+    assert_ne!(
+        first["proof_receipt"]["sha256"], second["proof_receipt"]["sha256"],
+        "fresh and replayed proof evidence must have distinct receipt identities"
+    );
+    assert_eq!(
+        without_cache_provenance(&first["proof_receipt"]),
+        without_cache_provenance(&second["proof_receipt"]),
+        "fresh and replayed checks changed evidence other than cache provenance"
     );
 
     let first_receipt = &first["proof_receipt"];
@@ -4986,7 +5934,7 @@ async fn two_identical_runs_produce_one_receipt() {
         "the incomplete digest moved between identical runs"
     );
 
-    // A hash mismatch has two causes and they need different answers. Real
+    // A mismatch after cache provenance is removed has two causes. Real
     // nondeterminism is the bug this test exists for. A prover that reached its
     // budget in one run and not the other is a loaded host, and reporting that
     // as nondeterminism sends the reader to look for an ordering bug that is
@@ -4997,7 +5945,7 @@ async fn two_identical_runs_produce_one_receipt() {
     // involves a timeout is named as what it is. It still fails, because a
     // silent pass would hide a real divergence behind the same excuse, but it
     // fails saying which of the two happened.
-    if first_receipt["sha256"] != second_receipt["sha256"] {
+    if without_cache_provenance(first_receipt) != without_cache_provenance(second_receipt) {
         let statuses = |receipt: &serde_json::Value| {
             receipt["goals"]
                 .as_array()
@@ -10307,10 +11255,25 @@ async fn a_conclusion_can_name_the_target_it_settles() {
     .await
     .unwrap();
 
+    // Through check rather than run_wp, because the evidence gate wants a
+    // receipt that records a soundness verdict and only check writes one. The
+    // subject here is which target a stored verdict names, which is the same
+    // either way.
     let wp = call_tool_json(
         &client,
-        "run_wp",
-        json!({"functions": ["swap"], "verify_profile": "swap"}),
+        "check",
+        // No timeout or model here: a verify_profile owns the proof settings
+        // and refuses a call that also states one, which would leave the WP
+        // step unrun and the receipt carrying no functions to match. The files
+        // are named because a check that does not say what it is about writes
+        // an empty source list, which the profile then reads as evidence about
+        // a different target.
+        json!({
+            "files": [target.to_str().unwrap()],
+            "function": "swap",
+            "verify_profile": "swap",
+            "detail": "full",
+        }),
     )
     .await
     .unwrap();
@@ -10340,10 +11303,32 @@ async fn a_conclusion_can_name_the_target_it_settles() {
         "{wrong_function:?}"
     );
 
-    call_tool_json(
+    // Stored as in_progress rather than verified, and the status is not what
+    // this test is about: the target naming below runs whatever the status is.
+    // swap-frame.c does not check clean, 36 of its goals are valid only under
+    // hypotheses nobody proved, so a verified conclusion for it is refused on
+    // the evidence gate before the naming is ever reached. It stored as
+    // verified until 2026-09-17 because the evidence was a run_wp receipt,
+    // whose bar is "every goal valid" rather than "check found nothing
+    // outstanding", which is the weaker bar that gate was added to close.
+    let verified_refused = call_tool_json(
         &client,
         "store_function_conclusion",
         json!({"function": "swap", "status": "verified",
+               "wp_summary": summary, "proof_receipt_sha256": sha,
+               "verify_profile": "swap"}),
+    )
+    .await
+    .expect_err("a fixture whose goals rest on unproved hypotheses is not verified");
+    assert!(
+        format!("{verified_refused:?}").contains("incomplete"),
+        "the refusal does not name the verdict it read: {verified_refused:?}"
+    );
+
+    call_tool_json(
+        &client,
+        "store_function_conclusion",
+        json!({"function": "swap", "status": "in_progress",
                "wp_summary": summary, "proof_receipt_sha256": sha,
                "verify_profile": "swap"}),
     )

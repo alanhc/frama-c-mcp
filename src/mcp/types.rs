@@ -251,6 +251,10 @@ pub struct ReloadProjectParams {
     /// Whether this load proves runtime-error obligations. Default: false.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte: Option<bool>,
+    /// With rte, false skips unsigned wrap and narrowing checks. Reported.
+    /// Default: true.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub rte_unsigned: Option<bool>,
     /// Register what the project's build system proves each target under, as an
     /// object keyed by target name. Emit it from the build system rather than
     /// writing it here, so it cannot drift from the command that decides:
@@ -344,8 +348,8 @@ pub struct RunWpParams {
     /// Claude Code stringified array.
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub functions: Option<Vec<String>>,
-    /// SMT prover override. Default uses all three: Alt-Ergo + CVC5 + Z3. Only
-    /// set to restrict to a single prover if needed.
+    /// SMT prover override. The default is Alt-Ergo, plus CVC5 and Z3 when
+    /// each is on PATH. Only set to restrict to a single prover if needed.
     pub prover: Option<String>,
     /// Isolated retry prover list. When provided, each prover is run through a
     /// separate Frama-C CLI attempt so server WP settings are not mutated.
@@ -361,8 +365,15 @@ pub struct RunWpParams {
     pub model: Option<String>,
     /// Property filter (comma-separated). +name to include, -name to exclude.
     pub prop: Option<String>,
-    /// Run Frama-C CLI smoke tests with -wp-smoke-tests. Requires provers.
+    /// Run WP smoke tests too, reporting any that WP could prove (vacuity).
     pub smoke: Option<bool>,
+
+    // Set by check's smoke parameter, never by a caller: it asks the main or
+    // sandbox run for the smoke probe without taking the isolated route that
+    // smoke plus provers selects.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub smoke_probe: bool,
     /// WP proof cache: None, Update, Replay, Rebuild, Offline, or Cleanup.
     /// Frama-C defaults to Update, so a verdict may be replayed; each goal
     /// reports from_cache. Pass None to prove everything in this run.
@@ -532,6 +543,12 @@ pub struct CheckParams {
     /// Enable RTE annotation generation before EVA/WP. Default: true.
     #[serde(default, deserialize_with = "deserialize_bool_or_string")]
     pub rte: Option<bool>,
+    /// With rte, false skips unsigned wrap and narrowing checks (RTE_REDUCED).
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub rte_unsigned: Option<bool>,
+    /// Also run WP smoke tests; a smoke goal WP proves is SMOKE_TEST_FAILED.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    pub smoke: Option<bool>,
     /// Response size. "summary" (default) returns counts plus the first few
     /// non-valid goals and undischarged alarms; "full" returns every goal and
     /// alarm. The verdict, incomplete[] and recommended_next_call are computed

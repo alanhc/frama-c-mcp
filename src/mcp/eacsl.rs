@@ -130,6 +130,7 @@ fn compile_args(
         isystem_paths: _,
         nostdinc: _,
         rte: _,
+        unsigned_rte_skipped: _,
     } = project_options;
 
     let mut args = vec![

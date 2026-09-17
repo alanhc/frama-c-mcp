@@ -1035,8 +1035,8 @@ pub fn proof_goal_diff(
         })
     };
 
-    // A stable id normally names one goal, but malformed or legacy receipts
-    // can repeat one. Keep every occurrence and prefer a match with the same
+    // A stable id normally names one goal, but malformed or legacy receipts can
+    // repeat one. Keep every occurrence and prefer a match with the same
     // progress state, then the same status, so reordering duplicates cannot
     // manufacture a transition.
     //
@@ -1390,6 +1390,105 @@ pub(crate) struct ProbeAndReceipt<'a> {
     pub source_files: Vec<String>,
     pub wp_goals: &'a [serde_json::Value],
     pub report_function: Option<&'a str>,
+    pub smoke: bool,
+}
+
+/// What the probes over a printed AST are asked to describe.
+///
+/// A struct because the smoke probe added the eighth argument: the five
+/// fields describe one run and travel together from attach_probe_and_receipt.
+pub(crate) struct PrintedAstProbe<'a> {
+    pub project_options: &'a ProjectLoadOptions,
+    pub rte: bool,
+    pub functions: &'a [String],
+    pub temp_dir_prefix: &'a str,
+    pub smoke: bool,
+}
+
+/// WP's goals, each carrying where its verdict came from.
+///
+/// One request per fetch rather than one per goal: measured on the 42 goals of
+/// tutorial/verker-string.c, the plug-in answers all of them in 50 ms, where
+/// the stock per-goal route (getProofStatus then getNodeInfos) takes 4.2 s.
+///
+/// A plug-in without the request, or one that fails, leaves every goal's
+/// from_cache null, which reads as unknown. The fetch itself still succeeds:
+/// not knowing whether a verdict was replayed is not a reason to have no goals.
+pub async fn fetch_wp_goals(client: &FramaCClient) -> Result<Vec<serde_json::Value>, McpError> {
+    let mut goals = reload_fetch(client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await?;
+    let ids: Vec<&str> = goals
+        .iter()
+        .filter_map(|goal| goal.get("wpo").and_then(serde_json::Value::as_str))
+        .collect();
+    let stats = if ids.is_empty() {
+        serde_json::Value::Null
+    } else {
+        client
+            .get("plugins.ast-utils.getGoalCacheStats", json!({"goals": ids}))
+            .await
+            .unwrap_or(serde_json::Value::Null)
+    };
+    crate::mcp::server::wpclass::apply_cache_provenance(&mut goals, &stats);
+    Ok(goals)
+}
+
+/// Keep only the goals of the selected properties.
+///
+/// WP's goal table still holds the goals earlier runs generated for the same
+/// functions, so a narrowed run would otherwise report those beside its own.
+pub fn retain_selected_goals(goals: &mut Vec<serde_json::Value>, selection: &[String]) {
+    goals.retain(|goal| {
+        goal.get("property")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|property| selection.iter().any(|key| key == property))
+    });
+}
+
+/// The keys of the property rows a WP prop filter selects; see
+/// select_prop_markers for the syntax.
+pub fn select_prop_rows(rows: &[&serde_json::Value], prop: &str) -> Vec<String> {
+    let entries: Vec<(bool, &str)> = prop
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.strip_prefix('-') {
+            Some(rest) => (false, rest.trim()),
+            None => (true, entry.strip_prefix('+').unwrap_or(entry).trim()),
+        })
+        .collect();
+    let matches = |row: &serde_json::Value, pattern: &str| match pattern.strip_prefix('@') {
+        Some(category) => row["kind"]
+            .as_str()
+            .is_some_and(|kind| kind == category || kind.ends_with(&format!("_{category}"))),
+        None => row["names"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(pattern))),
+    };
+    let any_positive = entries.iter().any(|(positive, _)| *positive);
+    rows.iter()
+        .filter(|row| {
+            let included = !any_positive
+                || entries.iter().any(|(positive, pattern)| *positive && matches(row, pattern));
+            let excluded = entries.iter().any(|(positive, pattern)| !*positive && matches(row, pattern));
+            included && !excluded
+        })
+        .filter_map(|row| row["key"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Whether this run was asked for smoke tests at all, by either spelling.
+///
+/// check asks through smoke_probe, a caller through smoke. Both mean the same
+/// thing on either route, so neither route reads params.smoke alone. check
+/// forwards the caller's provers, which sends the run down the isolated CLI
+/// route, where a gate reading params.smoke saw None and ran no smoke probe.
+/// The call then reported SMOKE_TEST_UNCHECKED with "WP did not complete",
+/// which was false; WP completed and the route ignored the request.
+///
+/// Which route runs the probe is decided by provers alone, before this is
+/// asked: the socket route is reached only without them.
+pub(crate) fn smoke_requested(params: &RunWpParams) -> bool {
+    params.smoke == Some(true) || params.smoke_probe
 }
 
 /// What a WP run is about to prove, read off the session state in one go.
@@ -1466,10 +1565,16 @@ fn printed_source_options(options: &ProjectLoadOptions) -> ProjectLoadOptions {
         isystem_paths: _,
         nostdinc: _,
 
-        // Not emitted by project_cli_args for anyone, so there is nothing here
-        // to carry. The probe decides -wp-rte for itself, from what the run it
-        // describes actually guarded.
-        rte: _,
+        // Not emitted by project_cli_args for anyone. The probe decides
+        // whether to ask WP for RTE from what the run it
+        // describes actually guarded, but unsigned_rte_args needs this
+        // load-time setting to decide whether those guards included unsigned
+        // overflow and downcast checks.
+        rte,
+
+        // Carried, because the probe passes the unsigned options beside -wp-rte
+        // and has to pass the same ones the run did.
+        unsigned_rte_skipped,
     } = options;
 
     ProjectLoadOptions {
@@ -1477,6 +1582,8 @@ fn printed_source_options(options: &ProjectLoadOptions) -> ProjectLoadOptions {
         // which separations the memory model needs, which is the whole question
         // a probe is asking.
         machdep: machdep.clone(),
+        rte: *rte,
+        unsigned_rte_skipped: *unsigned_rte_skipped,
         ..ProjectLoadOptions::default()
     }
 }
@@ -1800,12 +1907,6 @@ enum RunWpScope {
 }
 
 fn run_wp_target_scope(params: &RunWpParams) -> Result<RunWpScope, McpError> {
-    if params.smoke == Some(true) && params.provers.is_none() {
-        return Err(McpError::invalid_params(
-            "smoke requires provers so run_wp uses isolated CLI retries",
-            None,
-        ));
-    }
     let Some(names) = params.functions.as_ref() else {
         return Ok(RunWpScope::Main);
     };
@@ -2145,6 +2246,7 @@ pub fn profile_matches_loaded_project(
         rte,
         isystem_paths,
         nostdinc,
+        unsigned_rte_skipped,
     } = options;
 
     compilation_database.is_none()
@@ -2159,6 +2261,7 @@ pub fn profile_matches_loaded_project(
         // Unset means the profile does not speak to it, and only a profile that
         // does can be proof evidence, which the evidence gate enforces.
         && profile.rte.is_none_or(|want| want == *rte)
+        && profile.rte_unsigned.is_none_or(|want| want != *unsigned_rte_skipped)
 
         // Compared exactly, like the three lists above it and unlike the two
         // Option flags beside it. It was briefly loosened to treat an empty
@@ -2172,6 +2275,46 @@ pub fn profile_matches_loaded_project(
         // include_paths and defines have always meant here.
         && &profile.isystem_paths == isystem_paths
         && profile.nostdinc.is_none_or(|want| want == *nostdinc)
+}
+
+/// What a WP run resolved as its subject, before any proof is scheduled.
+///
+/// decl_markers is what startProofs is handed and is the prop selection when
+/// there was one, so the two are kept side by side rather than the caller
+/// having to remember which won.
+struct WpProofTargets {
+    targets: Vec<crate::state::FunctionInfo>,
+    rte_guarded: Vec<String>,
+    decl_markers: Option<Vec<String>>,
+    prop_selection: Option<Vec<String>>,
+}
+
+/// What run_evidence_gates is asked about, as one value.
+///
+/// A struct rather than eight positional arguments, for the reason
+/// PrintedAstProbe and SmokeProbeRequest are: they describe a single check
+/// call and travel together from its one caller.
+pub struct RunEvidenceInputs<'a> {
+    pub wanted: WantedAnalyses,
+    pub requested_smoke: bool,
+    pub rte: bool,
+    pub narrowed_by_prop: Option<&'a str>,
+    pub messages: &'a [serde_json::Value],
+    pub messages_truncated: bool,
+    pub wp: &'a serde_json::Value,
+    pub wp_goals: &'a serde_json::Value,
+}
+
+/// What those gates found, plus the two diagnoses the payload reports.
+///
+/// The diagnoses come back rather than being written here, because
+/// check_payload reports them whether or not they made the run incomplete: a
+/// backend anomaly no goal was waiting on is still worth showing.
+pub struct RunEvidenceGates {
+    pub gaps: Vec<serde_json::Value>,
+    pub backend_diagnosis: serde_json::Value,
+    pub memory_model: serde_json::Value,
+    pub anomaly_left_goals_unjudged: bool,
 }
 
 #[tool_router(router = analysis_router, vis = "pub(crate)")]
@@ -2252,13 +2395,28 @@ impl FramaCMcpServer {
             frama_c_options.push("-eva-precision".to_string());
             frama_c_options.push(precision.to_string());
         }
-        if let Some(ref main_fn) = params.main_function {
-            (self.require_client().await?)
-                .set("kernel.parameters.setMain", json!(main_fn))
-                .await
-                .map_err(McpError::from)?;
+        // Set on every EVA run, both ways, rather than only where a caller
+        // named one. The kernel's -main is sticky and reload_files_in_place
+        // does not respawn when the files and options are unchanged, so a
+        // value written for one call survived into the next: measured on a
+        // two-function file, check{files} alone is proved with 6 goals, while
+        // the same call after check{function:"g", want:["eva"]} comes back
+        // incomplete with 4 and WP_VERIFICATION_SKIPPED, WP having refused "g"
+        // as a recursive entry point. That path never reaches check_wp_step,
+        // which is where the reset used to live, so the reset has to be here
+        // where the value is produced. A call that names no function means the
+        // default entry point, and saying so costs one request.
+        let main_fn = params.main_function.as_deref().unwrap_or("main");
+        (self.require_client().await?)
+            .set("kernel.parameters.setMain", json!(main_fn))
+            .await
+            .map_err(McpError::from)?;
+
+        // Recorded only when the caller asked, because frama_c_options is what
+        // this call requested rather than what the kernel now holds.
+        if let Some(ref requested) = params.main_function {
             frama_c_options.push("-main".to_string());
-            frama_c_options.push(main_fn.clone());
+            frama_c_options.push(requested.clone());
         }
         if let Some(slevel) = params.slevel {
             (self.require_client().await?)
@@ -2522,6 +2680,25 @@ impl FramaCMcpServer {
         wp_params: RunWpParams,
         function: Option<&str>,
     ) -> (serde_json::Value, serde_json::Value) {
+        // A scoped check sets the entry point to the function for EVA, and WP
+        // reads the same kernel setting: it then refused a function that has a
+        // caller as a "(potentially) recursive" entry point, generating no goal
+        // for its postcondition, and turned the function's own requires into an
+        // obligation. Put back to Frama-C's default before WP. Measured: EVA's
+        // alarms from the scoped run survive, the postcondition becomes a goal
+        // again, and a lemma or axiom in scope is still reported.
+        //
+        // Unconditionally, not only for a scoped check. The value is sticky and
+        // run_eva_payload is what writes it, so a call that asks for WP alone
+        // never passes the place it would be put back: measured, check
+        // {function:"g", want:["eva"]} followed by check {want:["wp"]} left
+        // -main at "g" and the second call came back with 4 goals and
+        // WP_VERIFICATION_SKIPPED where a clean run has 6. Guarding this on
+        // "did this call name a function" asked about the wrong call, since the
+        // stale value comes from the previous one.
+        if let Ok(client) = self.require_client().await {
+            let _ = client.set("kernel.parameters.setMain", json!("main")).await;
+        }
         let wp = match self.run_wp(Parameters(wp_params)).await {
             Ok(result) => tool_result_json(result),
             Err(error) => check_step_error(&error),
@@ -2735,19 +2912,26 @@ impl FramaCMcpServer {
             source_files,
             wp_goals,
             report_function,
+            smoke,
         } = args;
 
-        let (probe, printed_source) = self
+        let (probe, smoke_probe, printed_source) = self
             .memory_model_probe_over_printed_ast(
                 client,
-                project_options,
-                rte,
-                probe_functions,
                 response,
-                temp_dir_prefix,
+                PrintedAstProbe {
+                    project_options,
+                    rte,
+                    functions: probe_functions,
+                    temp_dir_prefix,
+                    smoke,
+                },
             )
             .await;
         response["memory_model_probe"] = probe;
+        if let Some(smoke_probe) = smoke_probe {
+            response["smoke_probe"] = smoke_probe;
+        }
 
         self.attach_run_wp_receipt(
             client,
@@ -2792,19 +2976,30 @@ impl FramaCMcpServer {
     pub(crate) async fn memory_model_probe_over_printed_ast(
         &self,
         client: &FramaCClient,
-        project_options: &ProjectLoadOptions,
-        rte: bool,
-        functions: &[String],
         response: &serde_json::Value,
-        temp_dir_prefix: &str,
-    ) -> (serde_json::Value, Option<String>) {
+        probe: PrintedAstProbe<'_>,
+    ) -> (serde_json::Value, Option<serde_json::Value>, Option<String>) {
+        let PrintedAstProbe {
+            project_options,
+            rte,
+            functions,
+            temp_dir_prefix,
+            smoke,
+        } = probe;
+
+        // The smoke probe shares every early exit below, with the same reason,
+        // because it needs the same printed AST on disk.
+        let absent = |reason: &str| smoke.then(|| json!({"ran": false, "reason": reason}));
         let source = match client.print_source().await {
             Ok(source) if !source.trim().is_empty() => source,
             Ok(_) => {
                 let reason = "printSource returned nothing, so there is no AST to probe";
-                return (probe_absent(reason, false), None);
+                return (probe_absent(reason, false), absent(reason), None);
             }
-            Err(error) => return (probe_absent(format!("printSource failed: {error}"), false), None),
+            Err(error) => {
+                let reason = format!("printSource failed: {error}");
+                return (probe_absent(reason.clone(), false), absent(&reason), None);
+            }
         };
 
         // Asked before the AST is written out, and after it is printed. A run
@@ -2819,10 +3014,8 @@ impl FramaCMcpServer {
         // unrestricted frama-c would attribute some other function's separation
         // to a run that never proved it.
         if functions.is_empty() {
-            return (
-                probe_absent("the run named no defined function for the probe to describe", true),
-                Some(source),
-            );
+            let reason = "the run named no defined function for the probe to describe";
+            return (probe_absent(reason, true), absent(reason), Some(source));
         }
 
         // Bounded by the same semaphore as every other extra front end this
@@ -2846,25 +3039,53 @@ impl FramaCMcpServer {
             // caller a second sixty-second printSource.
             Err(error) => {
                 let reason = format!("the printed AST could not be written: {error}");
-                return (probe_absent(reason, false), Some(source));
+                return (probe_absent(reason.clone(), false), absent(&reason), Some(source));
             }
         };
+
+        // Read once for both probes. They describe the same run over the same
+        // printed AST and differ only in what they ask WP to do, so a value
+        // that reached one and not the other would be a probe answering about
+        // a configuration nothing ran under.
+        let probe_options = printed_source_options(project_options);
+        let probe_model = response
+            .pointer("/effective_wp_config/model")
+            .and_then(|value| value.as_str());
+        let probe_prop = response
+            .pointer("/effective_wp_config/prop/effective")
+            .and_then(|value| value.as_str());
 
         let probe = run_wp_memory_model_probe(
             &self.frama_c_path,
             std::slice::from_ref(&path),
-            &printed_source_options(project_options),
+            &probe_options,
             rte,
-            response
-                .pointer("/effective_wp_config/model")
-                .and_then(|value| value.as_str()),
+            probe_model,
             functions,
-            response
-                .pointer("/effective_wp_config/prop/effective")
-                .and_then(|value| value.as_str()),
+            probe_prop,
         )
         .await;
-        (probe, Some(source))
+
+        // While the printed file still exists: its guard is dropped on return.
+        let smoke_probe = if smoke {
+            Some(
+                run_wp_smoke_probe(
+                    &self.frama_c_path,
+                    SmokeProbeRequest {
+                        files: std::slice::from_ref(&path),
+                        project_options: &probe_options,
+                        rte,
+                        model: probe_model,
+                        functions,
+                        run: &response["effective_wp_config"],
+                    },
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        (probe, smoke_probe, Some(source))
     }
 
     /// What WP assumed about the memory model on this run, or why nobody asked.
@@ -2966,8 +3187,232 @@ impl FramaCMcpServer {
         Ok(())
     }
 
+    /// The gaps that come from what this call asked for, not from what the
+    /// analysis found.
+    ///
+    /// Both entries are answers to "what did the caller decline", which no
+    /// goal, alarm or message can report: the goals they would have produced
+    /// were never generated, so nothing downstream sees an absence. Grouped
+    /// because they are the only two of that kind and because check_payload is
+    /// against a hard length ceiling.
+    async fn withheld_by_request_gaps(&self, rte: bool, prop: Option<&str>) -> Vec<serde_json::Value> {
+        let mut gaps = Vec::new();
+        let unsigned_skipped = self
+            .main_frama_c_state
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|state| state.project_options.unsigned_rte_skipped);
+        if rte && unsigned_skipped {
+            gaps.push(json!({
+                "code": incomplete_code::RTE_REDUCED,
+                "reason": "RTE ran without the unsigned overflow and downcast checks, so unsigned \
+                           wraparound and narrowing were not checked.",
+            }));
+        }
+
+        // A narrowed check is not a verdict about the file, and nothing else in
+        // the list would say so. WP generates goals only for the selected
+        // properties, so the ones it skipped cannot show up as GOAL_NOT_VALID
+        // the way they do in a full run: measured on a file whose failing
+        // assert is invisible under prop, check reported proved with zero goals
+        // while the unnarrowed run reported incomplete. The verdict rule is
+        // that proved means an empty incomplete[], so the entry is the fix.
+        if let Some(prop) = prop {
+            gaps.push(json!({
+                "code": incomplete_code::CHECK_NARROWED_BY_PROP,
+                "reason": "WP ran under a prop filter, so only the selected properties were \
+                           attempted and this verdict does not cover the rest.",
+                "prop": prop,
+            }));
+        }
+        gaps
+    }
+
+    /// The gates that read this run's message stream and its external probes.
+    ///
+    /// Separate from check_incomplete_items, which reads goals and alarms:
+    /// these four sources, the drain, the backend diagnosis, the smoke probe
+    /// and the memory-model probe, are evidence about whether the analysis
+    /// happened rather than about what it found, and they are the ones that
+    /// fail closed when the evidence itself is missing. Lifted out of
+    /// check_payload because that function is against a hard length ceiling
+    /// and this band is the part of it with its own subject.
+    pub async fn run_evidence_gates(&self, input: RunEvidenceInputs<'_>) -> RunEvidenceGates {
+        let RunEvidenceInputs {
+            wanted,
+            requested_smoke,
+            rte,
+            narrowed_by_prop,
+            messages,
+            messages_truncated,
+            wp: input_wp,
+            wp_goals,
+        } = input;
+        let mut gaps: Vec<serde_json::Value> = Vec::new();
+        let model = input_wp
+            .pointer("/effective_wp_config/model")
+            .and_then(|value| value.as_str());
+
+        // Read from the drain above, because no goal carries it. A Why3 abort
+        // stamps every affected goal FAILED and says why on the message stream
+        // rather than in the record, so a run that only reads goals reports a
+        // crashed backend as a wrong specification.
+        let backend_diagnosis = wp_backend_diagnosis(messages, model);
+
+        // An abort is only a gap when it left something unjudged. WP runs
+        // Alt-Ergo, CVC5 and Z3 by default and keeps the first success, so one
+        // prover's Why3 driver can crash on a goal another prover then proves.
+        // Counting that as incomplete turns a fully proved run into
+        // "incomplete" over a backend hiccup no goal is waiting on, which is
+        // the same wrong answer in the other direction. The diagnosis is still
+        // reported; only the verdict is left alone.
+        let anomaly_left_goals_unjudged =
+            wp_backend_anomaly_left_goal_unjudged(&backend_diagnosis, wp_goals);
+        if anomaly_left_goals_unjudged {
+            let field = |name: &str| {
+                backend_diagnosis
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            };
+            gaps.push(json!({
+                "code": incomplete_code::WP_BACKEND_ANOMALY,
+                "reason": field("reason"),
+                "kind": field("kind"),
+                "model": field("model"),
+                "anomaly_count": field("anomaly_count"),
+            }));
+        }
+
+        // The goals were fetched after run_wp returned, and run_wp drops
+        // main_wp_lock when it does, so a concurrent reload or proof on the
+        // same session can replace the table in that window. The run recorded
+        // how many goals it produced, so a disagreement with what was read
+        // back is that window having been used: a reload that cleared the
+        // table would otherwise leave an empty goal list, which no other gate
+        // treats as suspicious, and the verdict would come back proved on
+        // evidence belonging to a different project.
+        //
+        // Only when prop did not narrow the run. retain_selected_goals trims
+        // the run's own goals while the read-back is of the whole session
+        // table, so the two legitimately differ there: measured on
+        // prop-named-asserts.c, prop "-one" gives 4 against 7. A narrowed
+        // check also carries CHECK_NARROWED_BY_PROP and can never be proved,
+        // so the window cannot produce a false proof on that path anyway.
+        // A function-scoped check reads back that function's selected goals,
+        // whereas the run measurement is the complete WP invocation.  Those
+        // are deliberately different counts, just as with -wp-prop.
+        let function_scoped = input_wp
+            .pointer("/effective_wp_config/functions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|functions| !functions.is_empty());
+        if wanted.wp && narrowed_by_prop.is_none() && !function_scoped {
+            let measured = input_wp.pointer("/measurement/goals").and_then(serde_json::Value::as_u64);
+            let read_back = wp_goals.as_array().map(|goals| goals.len() as u64);
+            if let (Some(measured), Some(read_back)) = (measured, read_back) {
+                if measured != read_back {
+                    gaps.push(json!({
+                        "code": incomplete_code::WP_GOALS_CHANGED_UNDER_CHECK,
+                        "reason": format!(
+                            "The proof run produced {measured} goals and {read_back} were read \
+                             back, so the goal table changed between the two."
+                        ),
+                        "run_goals": measured,
+                        "read_back_goals": read_back,
+                    }));
+                }
+            }
+        }
+
+        gaps.extend(smoke_test_gaps(wanted.wp && requested_smoke, input_wp));
+
+        // The prop half only when WP ran: prop is a WP property filter and
+        // narrows nothing in a check that asked for EVA alone, so reporting it
+        // there is a gap about work the call never wanted.
+        let narrowed_by_prop = narrowed_by_prop.filter(|_| wanted.wp);
+        gaps.extend(self.withheld_by_request_gaps(rte, narrowed_by_prop).await);
+        // Fail closed when the stream the gates below read was not read to the
+        // end. Four of the codes are derived from messages and from nothing
+        // else, so an incomplete drain and a clean run produce the same empty
+        // list; without this entry the difference is invisible and the verdict
+        // reads proved. Same shape as AST_PARSE_DIAGNOSTICS_UNAVAILABLE uses
+        // for the sibling evidence source, and adding it once covers every
+        // present and future message-derived gate rather than each one having
+        // to prove its own input was complete.
+        if messages_truncated {
+            gaps.push(json!({
+                "code": incomplete_code::WP_MESSAGES_TRUNCATED,
+                "reason": "The analyzer's message stream was not read to the end, so the gates \
+                           derived from it cannot distinguish a clean run from an unread one.",
+            }));
+        }
+        gaps.extend(wp_message_gaps(messages, model));
+
+        // Not from the drain, though it took a measurement to learn that. WP
+        // emits its memory-model hypotheses from the batch entry point, and the
+        // server request that runs proofs never reaches that code, so the
+        // socket carries nothing to classify. A fresh Frama-C with provers off
+        // is the only source, and it is one process rather than one per goal.
+        let memory_model = self.memory_model_probe(wanted, input_wp).await;
+        gaps.extend(memory_model_hypothesis_gap(&memory_model));
+        gaps.extend(memory_model_unchecked_gap(&memory_model, wanted));
+
+        RunEvidenceGates {
+            gaps,
+            backend_diagnosis,
+            memory_model,
+            anomaly_left_goals_unjudged,
+        }
+    }
+
+    /// What this run will prove: the target functions, the guards generated for
+    /// them, and the markers startProofs is given.
+    ///
+    /// Its own step because the order inside it is load-bearing and stating it
+    /// once beats restating it at the call site: the RTE guards are generated
+    /// before the prop selection resolves, so a filter naming an rte assert
+    /// sees a property that did not exist when the run began.
+    async fn resolve_what_to_prove(
+        &self,
+        client: &FramaCClient,
+        params: &RunWpParams,
+    ) -> Result<WpProofTargets, McpError> {
+        let targets = self
+            .resolve_wp_targets(client, params.functions.as_deref())
+            .await?;
+
+        let rte_guarded = self.generate_rte_guards(client, &targets).await?;
+
+        // A named target gets its own marker; "everything" asks for everything,
+        // so global obligations like lemmas are scheduled too.
+        let named_markers = params.functions.as_ref().map(|_| {
+            targets
+                .iter()
+                .map(|info| info.declaration.clone())
+                .collect::<Vec<_>>()
+        });
+
+        // After the RTE guards exist, so a prop naming an rte assert sees it.
+        let prop_selection = match params.prop.as_deref() {
+            Some(prop) => Some(self.select_prop_markers(client, &targets, prop).await?),
+            None => None,
+        };
+        let decl_markers = prop_selection.clone().or(named_markers);
+        Ok(WpProofTargets {
+            targets,
+            rte_guarded,
+            decl_markers,
+            prop_selection,
+        })
+    }
+
     pub async fn check_payload(&self, params: CheckParams) -> Result<serde_json::Value, McpError> {
         let wanted = WantedAnalyses::from_want(params.want.as_deref());
+        let requested_smoke = params.smoke == Some(true);
+
+        // Read before the WP parameters below consume it.
+        let narrowed_by_prop = params.prop.clone();
 
         // The guard goes on the server rather than on this stack frame. The
         // reload below records these paths as the session's loaded files, and
@@ -3011,6 +3456,7 @@ impl FramaCMcpServer {
                 // Resolved above, so a named profile cannot silently turn it
                 // off.
                 rte: Some(rte),
+                rte_unsigned: params.rte_unsigned,
 
                 // check's own detail governs goals and alarms; the function
                 // list it embeds is never the point of the call, and at full
@@ -3071,6 +3517,7 @@ impl FramaCMcpServer {
                     model: params.model,
                     prop: params.prop,
                     smoke: None,
+                    smoke_probe: requested_smoke,
                     cache: None,
                     cancel: None,
                     drain_timeout_seconds: None,
@@ -3094,10 +3541,22 @@ impl FramaCMcpServer {
         // something to drain, so this reports truncated rather than letting an
         // empty array read as a clean run. The failed-reload path above is the
         // opposite case: nothing ran, so nothing was missed.
-        let (messages, messages_truncated) = match self.require_client().await {
+        let (mut messages, messages_truncated) = match self.require_client().await {
             Ok(client) => drain_messages(&client).await,
             Err(_) => (Vec::new(), true),
         };
+
+        // Plus anything the isolated CLI route read off its own output. That
+        // route never touches the socket, so the drain above is empty for it
+        // and the four message-derived gates saw nothing: measured,
+        // check{provers} on generated-callee-spec.c reported no
+        // GENERATED_CALLEE_SPEC and on wp-unsound-encoding.c no
+        // WP_UNSOUND_ENCODING, while the same files without provers reported
+        // both. Merged rather than replaced, because a run can reach WP one way
+        // and still have kernel messages on the socket from the load.
+        if let Some(from_cli) = wp.get("messages").and_then(serde_json::Value::as_array) {
+            messages.extend(from_cli.iter().cloned());
+        }
 
         let mut incomplete = check_incomplete_items(
 
@@ -3114,49 +3573,24 @@ impl FramaCMcpServer {
             wanted,
         );
 
-        // Read from the drain above, because no goal carries it. A Why3 abort
-        // stamps every affected goal FAILED and says why on the message stream
-        // rather than in the record, so a run that only reads goals reports a
-        // crashed backend as a wrong specification.
-        let backend_diagnosis = wp_backend_diagnosis(
-            &messages,
-            wp.pointer("/effective_wp_config/model")
-                .and_then(|value| value.as_str()),
-        );
-
-        // An abort is only a gap when it left something unjudged. WP runs
-        // Alt-Ergo, CVC5 and Z3 by default and keeps the first success, so one
-        // prover's Why3 driver can crash on a goal another prover then proves.
-        // Counting that as incomplete turns a fully proved run into
-        // "incomplete" over a backend hiccup no goal is waiting on, which is
-        // the same wrong answer in the other direction. The diagnosis is still
-        // reported; only the verdict is left alone.
-        let anomaly_left_goals_unjudged =
-            wp_backend_anomaly_left_goal_unjudged(&backend_diagnosis, &wp_goals);
-        if anomaly_left_goals_unjudged {
-            let field = |name: &str| {
-                backend_diagnosis
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| json!(null))
-            };
-            incomplete.push(json!({
-                "code": incomplete_code::WP_BACKEND_ANOMALY,
-                "reason": field("reason"),
-                "kind": field("kind"),
-                "model": field("model"),
-                "anomaly_count": field("anomaly_count"),
-            }));
-        }
-
-        // Not from the drain, though it took a measurement to learn that. WP
-        // emits its memory-model hypotheses from the batch entry point, and the
-        // server request that runs proofs never reaches that code, so the
-        // socket carries nothing to classify. A fresh Frama-C with provers off
-        // is the only source, and it is one process rather than one per goal.
-        let memory_model = self.memory_model_probe(wanted, &wp).await;
-        incomplete.extend(memory_model_hypothesis_gap(&memory_model));
-        incomplete.extend(memory_model_unchecked_gap(&memory_model, wanted));
+        let RunEvidenceGates {
+            gaps,
+            backend_diagnosis,
+            memory_model,
+            anomaly_left_goals_unjudged,
+        } = self
+            .run_evidence_gates(RunEvidenceInputs {
+                wanted,
+                requested_smoke,
+                rte,
+                narrowed_by_prop: narrowed_by_prop.as_deref(),
+                messages: &messages,
+                messages_truncated,
+                wp: &wp,
+                wp_goals: &wp_goals,
+            })
+            .await;
+        incomplete.extend(gaps);
 
         let recommended_next_call = check_next_call(NextCallInputs {
             backend_diagnosis: &backend_diagnosis,
@@ -3485,16 +3919,18 @@ impl FramaCMcpServer {
             .iter()
             .filter(|prop| {
                 if let Some(ref marker) = scope_marker {
-                    let prop_scope = prop["scope"].as_str().unwrap_or_default();
-
-                    // A lemma belongs to no function and WP assumes it while
-                    // discharging every goal, so a function filter must not
-                    // hide one. Dropping it is what let `check --function f`
-                    // report `proved` on a file whose only lemma is `\false`
-                    // and whose postcondition is false.
-                    let global_lemma = prop["kind"].as_str() == Some("lemma");
-                    if prop_scope != marker && !global_lemma {
-                        return false;
+                    // A property with no function scope belongs to no function,
+                    // and WP assumes it while discharging every goal, so a
+                    // function filter must not hide one. Dropping lemmas is
+                    // what let "check --function f" report proved on a file
+                    // whose only lemma is \false. Exempting kind "lemma" alone
+                    // then left the same hole for axioms: an "admit lemma" and
+                    // an axiom are both kind "axiom", a global invariant is
+                    // "global_invariant", and none of them carries a scope
+                    // field at all.
+                    match prop["scope"].as_str() {
+                        Some(prop_scope) if prop_scope != marker => return false,
+                        _ => {}
                     }
                 }
                 if let Some(kind) = alarm_kind {
@@ -3580,7 +4016,7 @@ impl FramaCMcpServer {
 
         let properties_by_marker = property_status_map(&properties);
         let mut goals =
-            reload_fetch(&client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await?;
+            fetch_wp_goals(&client).await?;
         for goal in &mut goals {
             add_identity_fields(goal);
             enrich_goal_with_property_status(goal, &properties_by_marker);
@@ -4119,34 +4555,12 @@ impl FramaCMcpServer {
         self.apply_wp_config(&client, &params, requested_provers.as_ref())
             .await?;
 
-        let targets = self
-            .resolve_wp_targets(&client, params.functions.as_deref())
-            .await?;
-
-        // Every run regenerates, which is safe to repeat: measured on 33.0,
-        // three successive runs over the same function give the same eight
-        // goals with the same eight stable ids, so nothing is duplicated.
-        //
-        // Unconditional, and that is what dropping kernel -rte at load made it.
-        // The branch here used to skip generation for an rte=true load because
-        // the kernel had already put its own assertions into the AST, and those
-        // are a different, larger set: WP's generator emits no
-        // pointer_alignment. With the kernel out of it nothing else generates
-        // these, so an rte=true load that skipped this step proved no
-        // runtime-error obligations at all. Inverting the branch moved the hole
-        // rather than closing it, to rte=false, where the obligations are
-        // generated in place precisely so that asking for them does not cost a
-        // reload that would discard this session's injected annotations.
-        let rte_guarded = self.generate_rte_guards(&client, &targets).await?;
-
-        // A named target gets its own marker; "everything" asks for everything,
-        // so global obligations like lemmas are scheduled too.
-        let decl_markers = params.functions.as_ref().map(|_| {
-            targets
-                .iter()
-                .map(|info| info.declaration.clone())
-                .collect::<Vec<_>>()
-        });
+        let WpProofTargets {
+            targets,
+            rte_guarded,
+            decl_markers,
+            prop_selection,
+        } = self.resolve_what_to_prove(&client, &params).await?;
 
         // Read before scheduling, so a cancel landing any time from here on is
         // visible to the check after the drain.
@@ -4209,8 +4623,7 @@ impl FramaCMcpServer {
             .map(|info| info.name.clone())
             .collect::<Vec<_>>();
         let report_function = (function_names.len() == 1).then(|| function_names[0].as_str());
-        let wp_goals =
-            reload_fetch(&client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await?;
+        let wp_goals = fetch_wp_goals(&client).await?;
 
         // Everything downstream reads the retried goals, so a goal that flipped
         // is valid in the receipt and in the proofread report too, not only in
@@ -4221,6 +4634,7 @@ impl FramaCMcpServer {
                 &params,
                 requested_provers.as_ref(),
                 decl_markers.as_deref(),
+                prop_selection.as_deref(),
                 wp_goals,
             )
             .await?;
@@ -4262,6 +4676,15 @@ impl FramaCMcpServer {
             // even for a target that needed none: zero obligations is the
             // complete set for a function with no arithmetic.
             rte_enabled: rte_enabled || !rte_guarded.is_empty(),
+
+            // The load's setting, not this run's wish. run_wp generates WP's
+            // guards in place even for a load with rte: false, but the two
+            // unsigned switches are kernel state that the load set, and EVA
+            // reads them too: turning them on here would make one call's EVA
+            // and WP disagree about which obligations exist. So the guards this
+            // run adds carry unsigned obligations exactly when the load asked
+            // for them, and frama_c_options says which it was.
+            unsigned_rte: project_options.unsigned_rte(),
             frama_c_protocol: protocol_diagnostics,
             proofread_report: Some(proofread_report),
             goals: Some(wp_goals.as_slice()),
@@ -4295,6 +4718,7 @@ impl FramaCMcpServer {
             source_files,
             wp_goals: &wp_goals,
             report_function,
+            smoke: smoke_requested(&params),
         })
         .await?;
 
@@ -4353,8 +4777,19 @@ impl FramaCMcpServer {
         params: &RunWpParams,
         provers: Option<&Vec<String>>,
         decl_markers: Option<&[String]>,
-        goals: Vec<serde_json::Value>,
+        prop_selection: Option<&[String]>,
+        mut goals: Vec<serde_json::Value>,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value), McpError> {
+        // Every exit below returns goals this narrowed, including the retried
+        // set: prove_and_fetch re-reads the whole goal table rather than the
+        // list handed in, so a prop run with retry_unproved reported the goals
+        // of the properties prop excluded.
+        let narrow = |goals: &mut Vec<serde_json::Value>| {
+            if let Some(selection) = prop_selection {
+                retain_selected_goals(goals, selection);
+            }
+        };
+        narrow(&mut goals);
         if params.retry_unproved != Some(true) {
             return Ok((goals, serde_json::Value::Null));
         }
@@ -4410,11 +4845,75 @@ impl FramaCMcpServer {
             .set("plugins.wp.setTimeout", json!(before))
             .await
             .map_err(McpError::from);
-        let retried = retried?;
+        let mut retried = retried?;
         restored?;
+        narrow(&mut retried);
 
         let report = timeout_retry_report(&timed_out, &retried, before, doubled);
         Ok((retried, report))
+    }
+
+    /// The property markers a prop filter selects among the targets'
+    /// properties.
+    ///
+    /// prop narrows what is proved, not only what is configured. It used to
+    /// reach WP's -wp-prop setting alone, which the socket's startProofs never
+    /// reads for a declaration, so every goal of the function was generated
+    /// and reported whatever prop said. run_wp proves and retries the markers
+    /// returned here in place of the functions' declarations.
+    ///
+    /// WP's -wp-prop syntax, as far as this server can honour it exactly: a
+    /// comma-separated list of property names or "@kind" categories, each
+    /// optionally prefixed with "+" (select) or "-" (exclude). With no positive
+    /// entry every property of the targets is selected before the exclusions.
+    /// A name matches a property carrying that label; "@kind" matches the
+    /// property's kind, or its suffix, so "@invariant" matches loop_invariant.
+    /// A selection that matches nothing is refused with what was available,
+    /// because proving nothing and reporting it as the run is the silent
+    /// answer this replaces.
+    async fn select_prop_markers(
+        &self,
+        client: &FramaCClient,
+        targets: &[crate::state::FunctionInfo],
+        prop: &str,
+    ) -> Result<Vec<String>, McpError> {
+        for target in targets.iter().filter(|info| info.defined) {
+            client
+                .get("kernel.ast.printDeclaration", json!(target.declaration))
+                .await
+                .map_err(McpError::from)?;
+        }
+        let scopes: BTreeSet<&str> = targets.iter().map(|info| info.declaration.as_str()).collect();
+        let properties = fetch_properties(client).await?;
+
+        // Global assumptions have no scope. WP applies them to every target, so
+        // they must remain selectable alongside properties owned by one of the
+        // target declarations.
+        let in_scope: Vec<&serde_json::Value> = properties
+            .iter()
+            .filter(|row| {
+                row["scope"]
+                    .as_str()
+                    .is_none_or(|scope| scopes.contains(scope))
+            })
+            .collect();
+        let selected = select_prop_rows(&in_scope, prop);
+        if selected.is_empty() {
+            let mut available: BTreeSet<String> = BTreeSet::new();
+            for row in &in_scope {
+                if let Some(kind) = row["kind"].as_str() {
+                    available.insert(format!("@{kind}"));
+                }
+                for name in row["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+                    available.insert(name.to_string());
+                }
+            }
+            return Err(McpError::invalid_params(
+                format!("prop {prop:?} selects no property of the target functions; available: {available:?}"),
+                None,
+            ));
+        }
+        Ok(selected)
     }
 
     /// Schedule proofs and read back what they produced. The tasks are drained
@@ -4427,7 +4926,7 @@ impl FramaCMcpServer {
     ) -> Result<Vec<serde_json::Value>, McpError> {
         start_wp_proofs(client, decl_markers).await?;
         drain_wp_tasks(client, WP_DRAIN_BUDGET).await?;
-        reload_fetch(client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await
+        fetch_wp_goals(client).await
     }
 
     async fn verification_counts_payload(&self) -> Result<serde_json::Value, McpError> {
@@ -4648,8 +5147,8 @@ impl FramaCMcpServer {
         // has one. The scope kept is the caller's own spelling, sandbox prefix
         // and all, because run_wp records that same spelling under
         // wp_config.functions and the two are compared as written. Handing the
-        // diff stable_scope instead compared a bare "foo" against the
-        // "exp:foo" the receipt holds, which rejected every sandbox diff.
+        // diff stable_scope instead compared a bare "foo" against the "exp:foo"
+        // the receipt holds, which rejected every sandbox diff.
         let diff_since = match (since, function, status) {
             (Some(_), _, Some(_)) => {
                 return Err(McpError::invalid_params(
@@ -4719,7 +5218,7 @@ impl FramaCMcpServer {
         let properties_by_marker = property_status_map(&properties);
 
         let mut goals =
-            reload_fetch(&client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals").await?;
+            fetch_wp_goals(&client).await?;
         for goal in &mut goals {
             add_identity_fields(goal);
         }
@@ -4771,6 +5270,7 @@ impl FramaCMcpServer {
             // disappeared and reappeared.
             let current =
                 proof_receipt_goals(&selected, stable_scope.as_deref(), &properties_by_marker);
+
             // Retaken rather than held across the fetches above, which are
             // Frama-C round trips: a read guard spanning those blocks every
             // writer for the length of a WP run. refuse_unusable_since already
@@ -5108,9 +5608,7 @@ impl FramaCMcpServer {
             })?;
 
         let properties_by_marker = property_status_map(&all_props);
-        let mut goals = reload_fetch(&client, "plugins.wp.reloadGoals", "plugins.wp.fetchGoals")
-            .await
-            .unwrap_or_default();
+        let mut goals = fetch_wp_goals(&client).await.unwrap_or_default();
         for goal in &mut goals {
             add_identity_fields(goal);
             enrich_goal_with_property_status(goal, &properties_by_marker);
@@ -5588,12 +6086,12 @@ impl FramaCMcpServer {
             let state = self.state.read().await;
             state.get_conclusion(&resolved.function).cloned()
         };
-        let mut goals = reload_fetch(
-            &resolved.client,
-            "plugins.wp.reloadGoals",
-            "plugins.wp.fetchGoals",
-        )
-        .await?;
+
+        // Through fetch_wp_goals like every other goal fetch, not reload_fetch
+        // directly: this path returned goals with no from_cache at all, so a
+        // want ["vc"] read was the one place a caller could not tell a replayed
+        // verdict from a computed one.
+        let mut goals = fetch_wp_goals(&resolved.client).await?;
         for goal in &mut goals {
             add_identity_fields(goal);
             enrich_goal_with_property_status(goal, &properties_by_marker);

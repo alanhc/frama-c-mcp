@@ -14,10 +14,10 @@
 //! run_wp_memory_model_probe.
 
 use super::*;
-use crate::mcp::server::receipt::ISOLATED_RETRY_NO_AST;
 use crate::mcp::server::checkgaps::{
-    probe_absent, PROBE_READ_FROM_RETRY_OUTPUT, PROBE_READ_FROM_SEPARATE_RUN,
+    PROBE_READ_FROM_RETRY_OUTPUT, PROBE_READ_FROM_SEPARATE_RUN, probe_absent,
 };
+use crate::mcp::server::receipt::ISOLATED_RETRY_NO_AST;
 
 /// One isolated CLI retry: which files to load, what to prove in them, and
 /// under which provers.
@@ -52,6 +52,15 @@ impl FramaCMcpServer {
             params,
             scope,
         } = retry;
+
+        // This retry can add RTE guards to a project loaded without them, so
+        // the guard set is this invocation's, not the load's. Rebinding the
+        // options once gives the proof attempts and the smoke probe beside them
+        // one answer to which unsigned checks that set includes.
+        let project_options = ProjectLoadOptions {
+            rte: rte_enabled,
+            ..project_options
+        };
         let mut attempts = Vec::new();
 
         // Accumulated across provers, because the combined text below is per
@@ -75,67 +84,40 @@ impl FramaCMcpServer {
         // apart by a second variable. It also stops the parser rerunning over
         // every later attempt's output once an empty reading is in hand.
         let mut complete: Option<Vec<serde_json::Value>> = None;
+
+        // The analyzer's own warnings, read off every attempt's output, because
+        // the attempts are the same program under different provers and a
+        // warning one prints the others do too; wp_message_gaps keys on the
+        // code and the first line, so the repeats collapse into one entry
+        // carrying each distinct location. Parsed per attempt, so no attempt's
+        // whole log outlives its iteration.
+        let mut cli_messages: Vec<serde_json::Value> = Vec::new();
+        let smoke = crate::mcp::server::analysis::smoke_requested(params);
         let mut partial: Vec<serde_json::Value> = Vec::new();
         let timeout = effective_wp_timeout(params)?;
         let par = effective_wp_par(params)?;
         // Frama-C spells the CLI values in lower case.
         let cache_mode = effective_wp_cache(params)?.to_ascii_lowercase();
         for prover in &provers {
-            let mut cmd = tokio::process::Command::new(&self.frama_c_path);
-            cmd.args(project_cli_args(&project_options));
-            for file in &files {
-                cmd.arg(file);
-            }
-            cmd.arg("-wp")
-                .arg("-wp-prover")
-                .arg(prover)
-                .arg("-wp-model")
-                .arg(params.model.as_deref().unwrap_or(default_wp_model()));
-            if rte_enabled {
-                cmd.arg("-wp-rte");
-            }
-            if let Some(timeout) = timeout {
-                cmd.arg("-wp-timeout").arg(timeout.to_string());
-            }
-            if let Some(par) = par {
-                cmd.arg("-wp-par").arg(par.to_string());
-            }
-            if let Some(prop) = &params.prop {
-                cmd.arg("-wp-prop").arg(prop);
-            }
-            if params.smoke == Some(true) {
-                cmd.arg("-wp-smoke-tests");
-            }
-
-            // This path bypasses apply_wp_config entirely, so the cache mode
-            // has to be spelled again or `cache: "None"` would be silently
-            // ignored exactly when a caller asked for per-prover proof runs.
-            cmd.arg("-wp-cache").arg(&cache_mode);
-            if !functions.is_empty() {
-                cmd.arg("-wp-fct").arg(functions.join(","));
-            }
-            cmd.kill_on_drop(true);
+            let mut cmd = isolated_attempt_command(IsolatedAttempt {
+                frama_c_path: &self.frama_c_path,
+                files: &files,
+                project_options: &project_options,
+                params,
+                prover,
+                rte_enabled,
+                timeout,
+                par,
+                cache_mode: &cache_mode,
+                functions: &functions,
+            });
             let command_timeout = Duration::from_secs(u64::from(timeout.unwrap_or(600)) + 30);
             let output = match tokio::time::timeout(command_timeout, cmd.output()).await {
                 Ok(output) => output.map_err(|e| {
                     McpError::internal_error(format!("failed to run isolated WP retry: {e}"), None)
                 })?,
                 Err(_) => {
-                    attempts.push(json!({
-                        "prover": prover,
-                        "success": false,
-                        "exit_code": serde_json::Value::Null,
-                        "proved_goals": 0,
-                        "total_goals": 0,
-                        "timeout_seconds": timeout,
-                        "wp_timeout_triage": wp_timeout_triage(
-                            "mcp_server_timeout",
-                            false,
-                            "high",
-                            "The isolated Frama-C process exceeded the MCP-side command timeout.",
-                            json!([{"field": "command_timeout_seconds", "value": command_timeout.as_secs()}]),
-                        ),
-                    }));
+                    attempts.push(timed_out_attempt(prover, timeout, command_timeout));
                     continue;
                 }
             };
@@ -173,27 +155,8 @@ impl FramaCMcpServer {
                     crate::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&combined),
                 );
             }
-            let (proved_goals, total_goals) = parse_proved_goals(&combined);
-            let attempt_triage = if combined.to_ascii_lowercase().contains("timeout") {
-                wp_timeout_triage(
-                    "prover_timeout",
-                    true,
-                    "medium",
-                    "The isolated WP prover output mentions timeout.",
-                    json!([{"field": "output_contains", "value": "timeout"}]),
-                )
-            } else {
-                wp_timeout_triage_none()
-            };
-            attempts.push(json!({
-                "prover": prover,
-                "success": output.status.success(),
-                "exit_code": output.status.code(),
-                "proved_goals": proved_goals,
-                "total_goals": total_goals,
-                "timeout_seconds": timeout,
-                "wp_timeout_triage": attempt_triage,
-            }));
+            cli_messages.extend(parse_cli_messages(&combined));
+            attempts.push(completed_attempt(prover, &output.status, &combined, timeout));
         }
         let timeout_triage = attempts
             .iter()
@@ -232,9 +195,14 @@ impl FramaCMcpServer {
                     "effective": params.prop.as_deref(),
                     "effective_known": params.prop.is_some(),
                 },
+
+                // Effective is what this route actually passed WP, which is
+                // smoke_requested and not the caller's field alone: check asks
+                // through smoke_probe, and reporting params.smoke here denied a
+                // smoke run that had happened.
                 "smoke": {
                     "requested": params.smoke,
-                    "effective": params.smoke == Some(true),
+                    "effective": smoke,
                 },
                 "rte": rte_enabled,
                 "split_strategy": serde_json::Value::Null,
@@ -242,7 +210,7 @@ impl FramaCMcpServer {
             "frama_c_options": {
                 "mode": "isolated-cli-retry",
                 "files": files,
-                "smoke": params.smoke == Some(true),
+                "smoke": smoke,
             },
             "wp_timeout_triage": timeout_triage,
             "failure_kind": wp_failure_kind_from_tasks(
@@ -290,29 +258,49 @@ impl FramaCMcpServer {
                 }),
             },
         });
+        if smoke {
+            // -wp-prop suppresses WP's synthetic smoke goals. Keep the filter
+            // on the proof attempts, but measure vacuity separately.
+            response["smoke_probe"] = run_wp_smoke_probe(
+                &self.frama_c_path,
+                SmokeProbeRequest {
+                    files: &files,
+                    project_options: &project_options,
+                    rte: rte_enabled,
+                    model: params.model.as_deref(),
+                    functions: &functions,
+                    run: &response["effective_wp_config"],
+                },
+            )
+            .await;
+        }
+        response["messages"] = json!(cli_messages);
         let receipt = self
-            .proof_receipt(None, ProofReceiptRequest {
-                tool: "run_wp",
-                source_files: files,
-                wp_config: response["effective_wp_config"].clone(),
-                eva_config: eva_config_absent("tool_does_not_run_eva"),
-                goals: &[],
-                stable_scope: None,
-                goals_status_source: ISOLATED_RETRY_NO_AST,
-                reported: json!({
-                    "failure_kind": response["failure_kind"].clone(),
-                    "wp_timeout_triage": response["wp_timeout_triage"].clone(),
-                    "wp_attempts": response["wp_attempts"].clone(),
-                }),
-                // No goals in an isolated CLI retry payload.
-                properties: &HashMap::new(),
+            .proof_receipt(
+                None,
+                ProofReceiptRequest {
+                    tool: "run_wp",
+                    source_files: files,
+                    wp_config: response["effective_wp_config"].clone(),
+                    eva_config: eva_config_absent("tool_does_not_run_eva"),
+                    goals: &[],
+                    stable_scope: None,
+                    goals_status_source: ISOLATED_RETRY_NO_AST,
+                    reported: json!({
+                        "failure_kind": response["failure_kind"].clone(),
+                        "wp_timeout_triage": response["wp_timeout_triage"].clone(),
+                        "wp_attempts": response["wp_attempts"].clone(),
+                    }),
+                    // No goals in an isolated CLI retry payload.
+                    properties: &HashMap::new(),
 
-                // The isolated retry proves the files on disk in its own
-                // processes and never asks this server's Frama-C for anything,
-                // so there is no print in hand to share.
-                ast_source: None,
-                ast_digest: None,
-            })
+                    // The isolated retry proves the files on disk in its own
+                    // processes and never asks this server's Frama-C for
+                    // anything, so there is no print in hand to share.
+                    ast_source: None,
+                    ast_digest: None,
+                },
+            )
             .await;
         response["proof_receipt"] = receipt;
         Ok(json_result(response))
@@ -344,6 +332,7 @@ pub async fn run_wp_print(
     ]);
     if rte {
         args.push("-wp-rte".to_string());
+        args.extend(project_options.unsigned_rte_args());
     }
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
@@ -377,6 +366,385 @@ pub async fn run_wp_print(
         Err(_) => json!({
             "status": "timeout",
             "timeout_seconds": EXTERNAL_COMMAND_BUDGET.as_secs(),
+        }),
+    }
+}
+
+/// One isolated attempt's argv, as one value.
+///
+/// A struct for the reason SmokeProbeRequest is one: these all describe a
+/// single frama-c invocation and travel together from its one caller.
+struct IsolatedAttempt<'a> {
+    frama_c_path: &'a str,
+    files: &'a [String],
+    project_options: &'a ProjectLoadOptions,
+    params: &'a RunWpParams,
+    prover: &'a str,
+    rte_enabled: bool,
+    timeout: Option<u32>,
+    par: Option<u32>,
+    cache_mode: &'a str,
+    functions: &'a [String],
+}
+
+/// The wp_attempts row for an attempt whose process finished, read off its
+/// exit status and combined output.
+fn completed_attempt(
+    prover: &str,
+    status: &std::process::ExitStatus,
+    combined: &str,
+    timeout: Option<u32>,
+) -> serde_json::Value {
+    let (proved_goals, total_goals) = parse_proved_goals(combined);
+    let triage = if combined.to_ascii_lowercase().contains("timeout") {
+        wp_timeout_triage(
+            "prover_timeout",
+            true,
+            "medium",
+            "The isolated WP prover output mentions timeout.",
+            json!([{"field": "output_contains", "value": "timeout"}]),
+        )
+    } else {
+        wp_timeout_triage_none()
+    };
+    json!({
+        "prover": prover,
+        "success": status.success(),
+        "exit_code": status.code(),
+        "proved_goals": proved_goals,
+        "total_goals": total_goals,
+        "timeout_seconds": timeout,
+        "wp_timeout_triage": triage,
+    })
+}
+
+/// The wp_attempts row for an attempt this server killed at its own command
+/// timeout, which proved nothing and says whose clock ran out.
+fn timed_out_attempt(
+    prover: &str,
+    timeout: Option<u32>,
+    command_timeout: Duration,
+) -> serde_json::Value {
+    json!({
+        "prover": prover,
+        "success": false,
+        "exit_code": serde_json::Value::Null,
+        "proved_goals": 0,
+        "total_goals": 0,
+        "timeout_seconds": timeout,
+        "wp_timeout_triage": wp_timeout_triage(
+            "mcp_server_timeout",
+            false,
+            "high",
+            "The isolated Frama-C process exceeded the MCP-side command timeout.",
+            json!([{"field": "command_timeout_seconds", "value": command_timeout.as_secs()}]),
+        ),
+    })
+}
+
+/// Build the command for one prover's isolated proof run.
+///
+/// Lifted out of the retry loop because that loop does two things: it runs the
+/// attempts and it assembles the run's answer, and building an attempt's argv
+/// is the part with its own subject. It is also the sixth copy of this
+/// builder in the file, so the next WP option added has one fewer place to be
+/// forgotten.
+fn isolated_attempt_command(attempt: IsolatedAttempt<'_>) -> tokio::process::Command {
+    let IsolatedAttempt {
+        frama_c_path,
+        files,
+        project_options,
+        params,
+        prover,
+        rte_enabled,
+        timeout,
+        par,
+        cache_mode,
+        functions,
+    } = attempt;
+    let mut cmd = tokio::process::Command::new(frama_c_path);
+    cmd.args(project_cli_args(project_options));
+    for file in files {
+        cmd.arg(file);
+    }
+    cmd.arg("-wp")
+        .arg("-wp-prover")
+        .arg(prover)
+        .arg("-wp-model")
+        .arg(params.model.as_deref().unwrap_or(default_wp_model()));
+    if rte_enabled {
+        cmd.arg("-wp-rte")
+            .args(project_options.unsigned_rte_args());
+    }
+    if let Some(timeout) = timeout {
+        cmd.arg("-wp-timeout").arg(timeout.to_string());
+    }
+    if let Some(par) = par {
+        cmd.arg("-wp-par").arg(par.to_string());
+    }
+    if let Some(prop) = &params.prop {
+        cmd.arg("-wp-prop").arg(prop);
+    }
+
+    // This path bypasses apply_wp_config entirely, so the cache mode has to be
+    // spelled again or `cache: "None"` would be silently ignored exactly when a
+    // caller asked for per-prover proof runs.
+    cmd.arg("-wp-cache").arg(cache_mode);
+    if !functions.is_empty() {
+        cmd.arg("-wp-fct").arg(functions.join(","));
+    }
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// The analyzer's warnings and errors from a batch run's output, in the shape
+/// the socket drain produces.
+///
+/// The isolated CLI route never touches the socket, so the message-derived
+/// gates saw nothing on it: measured, check{provers} on
+/// generated-callee-spec.c reported no GENERATED_CALLEE_SPEC and on
+/// wp-unsound-encoding.c no WP_UNSOUND_ENCODING, while the same files through
+/// the socket route reported both. Those four gates are the ones that catch a
+/// proof resting on an invented contract or an unsound encoding, so a route
+/// that cannot see them is a route where "proved" means less.
+///
+/// Frama-C 33 prints a header, "[plugin:category] file:line: Warning:", and
+/// wraps the text onto following indented lines; a short one keeps its text on
+/// the header. Both are read here, because the wrapped form is the one the
+/// interesting messages take.
+pub fn parse_cli_messages(text: &str) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((tag, rest)) = rest.split_once(']') else {
+            continue;
+        };
+        let (plugin, category) = match tag.split_once(':') {
+            Some((plugin, category)) => (plugin, Some(category)),
+            None => (tag, None),
+        };
+
+        // The kind marker, with an optional "file:line:" between it and the
+        // tag.
+        let rest = rest.trim_start();
+        let (location, rest) = match rest.find("Warning:").or_else(|| rest.find("Error:")) {
+            Some(at) => (rest[..at].trim().trim_end_matches(':'), &rest[at..]),
+            None => continue,
+        };
+        let (kind, head) = match rest.strip_prefix("Warning:") {
+            Some(head) => ("WARNING", head),
+            None => ("ERROR", rest.trim_start_matches("Error:")),
+        };
+
+        // The wrapped body: every following line that is indented and is not
+        // itself a new tagged header.
+        let mut body = head.trim().to_string();
+        while index < lines.len() {
+            let next = lines[index];
+            if !next.starts_with(' ') || next.trim_start().starts_with('[') {
+                break;
+            }
+            if !body.is_empty() {
+                body.push(' ');
+            }
+            body.push_str(next.trim());
+            index += 1;
+        }
+        if body.is_empty() {
+            continue;
+        }
+
+        let source = location.rsplit_once(':').and_then(|(file, line)| {
+            let line: u64 = line.parse().ok()?;
+            Some(json!({"file": file, "line": line}))
+        });
+        let mut message = json!({
+            "plugin": plugin,
+            "kind": kind,
+            "message": body,
+        });
+        if let (Some(object), Some(category)) = (message.as_object_mut(), category) {
+            object.insert("category".to_string(), json!(category));
+        }
+        if let (Some(object), Some(source)) = (message.as_object_mut(), source) {
+            object.insert("source".to_string(), source);
+        }
+        messages.push(message);
+    }
+    messages
+}
+
+/// WP's smoke-test results in a batch run's output.
+///
+/// Frama-C 33.0 prints a doomed smoke goal as "[wp] [Failed] (Doomed) <goal>
+/// (Qed)" and totals them as "Smoke Tests: <passed> / <total>". A smoke goal
+/// is built to fail, so "Failed" there is WP proving it, which means the code
+/// or assumption it probes is dead or contradictory. No summary line means the
+/// run generated no smoke goal, and passed and total are null rather than zero
+/// so that reading is not mistaken for a clean result.
+pub fn parse_smoke_output(text: &str) -> serde_json::Value {
+    // WP prints a doomed goal more than once, as it is scheduled and again in
+    // the result, so the names are kept once each in the order first seen.
+    let mut failed: Vec<String> = Vec::new();
+    for name in text
+        .lines()
+        .filter_map(|line| line.split("[Failed] (Doomed) ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+    {
+        if !failed.iter().any(|seen| seen == name) {
+            failed.push(name.to_string());
+        }
+    }
+    let summary = text.lines().find_map(|line| {
+        let (passed, total) = line.trim().strip_prefix("Smoke Tests:")?.split_once('/')?;
+        Some((
+            passed.trim().parse::<u64>().ok()?,
+            total.trim().parse::<u64>().ok()?,
+        ))
+    });
+    json!({
+        "passed": summary.map(|(passed, _)| passed),
+        "total": summary.map(|(_, total)| total),
+        "failed": failed,
+    })
+}
+
+/// What a smoke probe is asked to run, as one value.
+///
+/// A struct for the reason PrintedAstProbe is one: the fields all describe a
+/// single run and travel together from the one caller, and as positional
+/// arguments they were eight of the same few types, where a transposed pair
+/// would still compile.
+pub struct SmokeProbeRequest<'a> {
+    pub files: &'a [String],
+    pub project_options: &'a ProjectLoadOptions,
+    pub rte: bool,
+    pub model: Option<&'a str>,
+    pub functions: &'a [String],
+
+    /// The proof run's effective_wp_config, which the probe reads its provers,
+    /// timeout and parallelism off.
+    pub run: &'a serde_json::Value,
+}
+
+/// Run WP's smoke tests over these files in a fresh Frama-C.
+///
+/// A separate process for the reason the memory-model probe below gives, plus
+/// one of its own: setting -wp-smoke-tests on the main instance would add
+/// smoke goals to any other run there for as long as it stayed set. Cache off,
+/// because a replayed smoke verdict says nothing about the program this run
+/// holds.
+pub async fn run_wp_smoke_probe(
+    frama_c_path: &str,
+    probe: SmokeProbeRequest<'_>,
+) -> serde_json::Value {
+    let SmokeProbeRequest {
+        files,
+        project_options,
+        rte,
+        model,
+        functions,
+        run,
+    } = probe;
+
+    if files.is_empty() {
+        return json!({"ran": false, "reason": "no source files available"});
+    }
+
+    // The proof run's own provers, parallelism and timeout, read off its
+    // effective_wp_config, so a smoke verdict is about the configuration the
+    // proof used. The defaults apply only where that run had none either.
+    let provers = run
+        .pointer("/provers/effective")
+        .and_then(serde_json::Value::as_array)
+        .map(|provers| {
+            provers
+                .iter()
+                .filter_map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|provers| !provers.is_empty())
+        .unwrap_or_else(|| default_wp_provers().to_string());
+    let timeout = run
+        .pointer("/timeout_seconds/effective")
+        .and_then(serde_json::Value::as_u64);
+    let par = run
+        .pointer("/parallel/effective")
+        .and_then(serde_json::Value::as_u64);
+    let mut args = project_cli_args(project_options);
+    args.extend(files.iter().cloned());
+    args.extend([
+        "-wp".to_string(),
+        "-wp-smoke-tests".to_string(),
+        "-wp-cache".to_string(),
+        "none".to_string(),
+        "-wp-prover".to_string(),
+        provers.clone(),
+        "-wp-timeout".to_string(),
+        timeout.unwrap_or(10).to_string(),
+    ]);
+    if let Some(par) = par {
+        args.extend(["-wp-par".to_string(), par.to_string()]);
+    }
+    if let Some(model) = model {
+        args.extend(["-wp-model".to_string(), model.to_string()]);
+    }
+    if rte {
+        args.push("-wp-rte".to_string());
+        args.extend(project_options.unsigned_rte_args());
+    }
+    for function in functions {
+        args.extend(["-wp-fct".to_string(), function.clone()]);
+    }
+
+    // No -wp-prop, deliberately, even though the proof run may have had one.
+    // Smoke goals are synthetic and carry no property name, so every filter
+    // form removes all of them: measured on Frama-C 33, a contradictory
+    // precondition reports "Smoke Tests: 0 / 1" with no filter and prints no
+    // smoke line at all under a named property, an "@ensures" category, or even
+    // "@smoke". Narrowing this probe to match the run would therefore not
+    // narrow it, it would switch it off, and the vacuity it exists to find is
+    // exactly what makes a narrowed proof meaningless. The run's own -wp-fct
+    // list is the scoping that does work and is passed above.
+    let started = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new(frama_c_path);
+    cmd.args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let command: Vec<String> = std::iter::once(frama_c_path.to_string())
+        .chain(args)
+        .collect();
+    match tokio::time::timeout(EXTERNAL_COMMAND_BUDGET, cmd.output()).await {
+        Ok(Ok(output)) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut probe = parse_smoke_output(&text);
+            probe["ran"] = json!(output.status.success());
+            probe["command"] = json!(command);
+            probe["provers"] = json!(provers);
+            probe["parallel"] = json!(par);
+            probe["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            if !output.status.success() {
+                probe["reason"] = json!(format!("frama-c exited with {:?}", output.status.code()));
+            }
+            probe
+        }
+        Ok(Err(error)) => json!({"ran": false, "reason": error.to_string(), "command": command}),
+        Err(_) => json!({
+            "ran": false,
+            "reason": format!("timed out after {} s", EXTERNAL_COMMAND_BUDGET.as_secs()),
+            "command": command,
         }),
     }
 }
@@ -425,6 +793,7 @@ pub async fn run_wp_memory_model_probe(
     }
     if rte {
         args.push("-wp-rte".to_string());
+        args.extend(project_options.unsigned_rte_args());
     }
 
     // The same targets the run proved, because WP warns about the functions it
@@ -456,8 +825,7 @@ pub async fn run_wp_memory_model_probe(
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let hypotheses =
-                crate::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&text);
+            let hypotheses = crate::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&text);
             let command: Vec<String> = std::iter::once(frama_c_path.to_string())
                 .chain(args)
                 .collect();
@@ -560,9 +928,10 @@ pub async fn run_why3_dump(
     // The one thing this gives up is a file over the size cap, which reports
     // "truncated": true with no content and was previously still on disk
     // because nothing cleaned it up. That was a leak rather than a promise.
-    let Ok(out_dir_guard) =
-        private_temp_dir(&format!("frama-c-why3-dump-{}-", function.replace(':', "-")))
-    else {
+    let Ok(out_dir_guard) = private_temp_dir(&format!(
+        "frama-c-why3-dump-{}-",
+        function.replace(':', "-")
+    )) else {
         return json!({
             "status": "error",
             "reason": "could not create a temporary directory for the why3 dump",
@@ -584,6 +953,7 @@ pub async fn run_why3_dump(
     ]);
     if rte {
         args.push("-wp-rte".to_string());
+        args.extend(project_options.unsigned_rte_args());
     }
 
     let mut cmd = tokio::process::Command::new(frama_c_path);
@@ -669,6 +1039,7 @@ pub async fn run_wp_counter_examples(
     ]);
     if rte {
         args.push("-wp-rte".to_string());
+        args.extend(project_options.unsigned_rte_args());
     }
     let command = std::iter::once(frama_c_path.to_string())
         .chain(args.clone())
