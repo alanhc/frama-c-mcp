@@ -50,6 +50,11 @@ pub const AST_UTILS_REQUESTS: &[AstUtilsSpec] = &[
     ("plugins.ast-utils.getLogicDeps", ProbeKind::Get, true),
     ("plugins.ast-utils.getRteObligations", ProbeKind::Get, true),
     ("plugins.ast-utils.getAcslValidation", ProbeKind::Get, true),
+
+    // Where each WP goal's verdict came from. Probed with an empty goal list,
+    // which asks about every goal WP has generated: none at probe time, so the
+    // probe is a registration check and touches nothing.
+    ("plugins.ast-utils.getGoalCacheStats", ProbeKind::Get, true),
     ("plugins.ast-utils.execSetWpConfig", ProbeKind::Exec, true),
     ("plugins.ast-utils.execAddAnnotation", ProbeKind::Exec, true),
     ("plugins.ast-utils.execAddGlobalAcsl", ProbeKind::Exec, true),
@@ -252,6 +257,7 @@ fn probe_payload(request: &str) -> serde_json::Value {
         "kernel.parameters.setMain" => json!("main"),
         "kernel.parameters.setEvaPrecision" => json!(0),
         "kernel.parameters.setEvaSlevel" => json!(0),
+        "plugins.ast-utils.getGoalCacheStats" => json!({"goals": []}),
         "kernel.parameters.setEvaIlevel" => json!(2),
         // Probing it turns monitoring on, which is what we want anyway.
         "kernel.services.setLogs" => json!(true),

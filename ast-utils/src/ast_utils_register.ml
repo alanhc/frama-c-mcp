@@ -986,6 +986,83 @@ let () =
        in
        set_result rq result)
 
+(* ====== getGoalCacheStats ====== *)
+
+(** Whether each goal's verdict came from WP's proof cache.
+
+    The server cannot read this from the goal table: wpApi's stats record
+    carries only summary, tactics, proved and total, and the "(Cached)" word in
+    that summary is printed for every cacheable goal whenever the cache mode is
+    updating, hit or miss. The flag that means a replay is on the prover result
+    itself, which is what this reports.
+
+    best_result_cached is the flag of the result VCS.best selects, and null when
+    that result is the synthetic one WP stores for a tactic proof, whose flag is
+    "every cacheable subgoal was cached" rather than a provenance. *)
+let () =
+  let s = Server.Request.signature () in
+  let get_goals = Server.Request.param s
+    ~name:"goals" ~descr:(Markdown.plain
+      "WP goal identifiers, as the goal table's \"wpo\" field spells them. \
+       An empty list asks about every goal WP has generated.")
+    (module Server.Data.Jlist(Server.Data.Jstring)) in
+  let set_result = Server.Request.result s
+    ~name:"result" ~descr:(Markdown.plain "Cache provenance per goal")
+    (module Server.Data.Jany) in
+  Server.Request.register_sig s
+    ~package
+    ~kind:`GET
+    ~name:"getGoalCacheStats"
+    ~descr:(Markdown.plain
+              "Report, per WP goal, whether the result deciding its verdict was \
+               read from the proof cache")
+    (fun rq () ->
+       let table = Hashtbl.create 97 in
+       let every = ref [] in
+       Wp.Wpo.iter_on_goals
+         (fun g ->
+            let id = Wp.Wpo.get_gid g in
+            Hashtbl.replace table id g;
+            every := id :: !every);
+       let wanted =
+         match get_goals rq with
+         | [] -> List.rev !every
+         | asked -> asked
+       in
+       let goals = ref [] and unknown = ref [] in
+       List.iter
+         (fun id ->
+            match Hashtbl.find_opt table id with
+            | None -> unknown := `String id :: !unknown
+            | Some g ->
+              let results = Wp.ProofEngine.results g in
+              let (prover, best) = Wp.VCS.best results in
+              let stats = Wp.ProofEngine.consolidated g in
+              (* 33 moved the prover type out of VCS into Prover, so the
+                 constructor and the printer are named differently. *)
+#if FRAMAC_MAJOR >= 33
+              let is_tactical = (match prover with Wp.Prover.Tactical -> true | _ -> false) in
+              let prover_name = Format.asprintf "%a" Wp.Prover.pretty prover in
+#else
+              let is_tactical = (match prover with Wp.VCS.Tactical -> true | _ -> false) in
+              let prover_name = Wp.VCS.name_of_prover prover in
+#endif
+              let cached =
+                if is_tactical then `Null else `Bool best.Wp.VCS.cached
+              in
+              goals := `Assoc [
+                ("wpo", `String id);
+                ("best_result_cached", cached);
+                ("best_prover", `String prover_name);
+                ("cached", `Int stats.Wp.Stats.cached);
+                ("cacheable", `Int stats.Wp.Stats.cacheable);
+              ] :: !goals)
+         wanted;
+       set_result rq (`Assoc [
+         ("goals", `List (List.rev !goals));
+         ("unknown", `List (List.rev !unknown));
+       ]))
+
 (* ====== execSetWpConfig ====== *)
 
 let () =

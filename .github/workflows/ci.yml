@@ -360,14 +360,29 @@ jobs:
           path: |
             ~/.opam
             _opam
-          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-32.1-cppo-v1
+          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-32.1-cppo-alt-ergo-2.6.3-v2
 
-      - name: Install Frama-C 32.1 and cppo
+      # alt-ergo for the same reason the full lane names it: it is an OPTIONAL
+      # dependency of frama-c, so installing frama-c alone brings why3 and not
+      # it. dune runtest below now includes run-cache-provenance.sh, which
+      # proves with "-wp-prover alt-ergo", and dune fails a script that exits
+      # non-zero, so its "SKIP - no prover" path would break this lane rather
+      # than pass it.
+      #
+      # Worth the install rather than skipping: this regression is the only
+      # place the plug-in's 32.1 cppo arm is executed anywhere. Compiling it is
+      # what this lane was for, and running it is strictly more.
+      - name: Install Frama-C 32.1, cppo and alt-ergo
         if: steps.cache-opam.outputs.cache-hit != 'true'
-        run: opam install -y frama-c.32.1 cppo
+        run: opam install -y frama-c.32.1 cppo alt-ergo.2.6.3
 
       - name: Check installed Frama-C version
         run: opam exec -- frama-c -version
+
+      # Outside ~/.opam, so it must run even on a cache hit, exactly as the
+      # full lane's copy says.
+      - name: Configure why3 (detect alt-ergo)
+        run: opam exec -- why3 config detect
 
       - name: ast-utils, build & install plugin
         working-directory: ast-utils
