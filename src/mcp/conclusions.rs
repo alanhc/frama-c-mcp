@@ -98,6 +98,7 @@ pub fn profile_evidence_error(
             rte,
             isystem_paths: profile.isystem_paths.clone(),
             nostdinc,
+            unsigned_rte_skipped: profile.rte_unsigned == Some(false),
         });
         if receipt.pointer("/subject/project_load") != Some(&expected_load) {
             return Some(format!(
@@ -172,10 +173,14 @@ impl FramaCMcpServer {
         description = "Store or update the verification conclusion for a function. \
         Supports incremental updates: fields set to null preserve previous values. \
         Stores only status, notes, committed specs, WP summary, proof receipt, and direct callees. \
-        Evidence for a verified status arrives as proof_receipt, the object run_wp returned, or \
-        more usefully as proof_receipt_sha256, the digest from it: a receipt is accepted only if \
-        its bytes hash to what this server wrote, so echoing one back by hand is both large and \
-        fragile, while the digest resolves to the same bytes here. Pass one or the other."
+        Evidence for a verified status is the proof_receipt of a check whose incomplete[] came \
+        back empty, or more usefully its proof_receipt_sha256. A direct receipt is checked only \
+        for internal consistency; its public hash does not authenticate that this server issued \
+        it. The digest form resolves bytes this server stored, so echoing one back by hand is \
+        both large and fragile. Pass one or the other. A \
+        run_wp receipt is refused, because the soundness gates run in check and run_wp records \
+        no verdict: an invented callee contract, a skipped function or annotation, an unsound \
+        encoding and a failed smoke test are all invisible to it."
     )]
     async fn store_function_conclusion(
         &self,

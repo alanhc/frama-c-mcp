@@ -360,7 +360,7 @@ pub fn classify_wp_failure_from_goal(
         goal_kind,
         name,
         &text,
-        goal_is_from_cache(goal),
+        goal_is_from_cache(goal) == Some(true),
         &mut push_evidence,
     );
     let failure_kind = wp_failure_kind(category, triage_kind);
@@ -1106,38 +1106,64 @@ pub fn goal_owner_name(goal: &serde_json::Value) -> Option<&str> {
 }
 
 /// Whether WP replayed this goal's verdict from its cache instead of proving
-/// it in this run.
+/// it in this run, or None when nothing said.
 ///
-/// The only signal Frama-C gives is the word in `stats.summary`, a free-form
-/// string that reads `(Qed 31ms) (Alt-Ergo 37ms) (Cached)`. Measured on 33.0:
-/// with the cache off no summary mentions it, with `Update` the
-/// prover-discharged goals all do, and the statuses are identical either way.
-/// So the cache changes only where a verdict came from, which is exactly what
-/// a proof receipt has to record.
-pub fn goal_is_from_cache(goal: &serde_json::Value) -> bool {
-    // The lifted field first. enrich_goal_stable_id puts it on every goal whose
-    // summary it could read, so no consumer has to know the answer comes from a
-    // word in a free-form string, and this function is a consumer like any
-    // other. Reading only the summary meant an enriched goal whose stats had
-    // been projected away answered "not cached", which is the confident
-    // direction and the one that hides a replayed verdict.
-    if let Some(lifted) = goal.get("from_cache").and_then(serde_json::Value::as_bool) {
-        return lifted;
-    }
-    summary_says_cached(goal)
+/// The field is written by apply_cache_provenance from the plug-in's
+/// getGoalCacheStats, which reads the cached flag of the result WP's own
+/// VCS.best selects. It was read off the word "(Cached)" in the free-form
+/// stats summary until 2026-09-16, and that was wrong in the mode nearly every
+/// call runs in: Stats.pp_stats prints it for every cacheable goal whenever the
+/// cache mode is updating, hit or miss, so a freshly computed proof reported as
+/// replayed. Measured on 42 goals of tutorial/verker-string.c: the flag is set
+/// for none on a cold cache and for the 18 prover-discharged goals on a warm
+/// one.
+///
+/// None means unknown, not false: a plug-in too old to answer, a request that
+/// failed, or a goal it did not know. A caller must not count it as either.
+pub fn goal_is_from_cache(goal: &serde_json::Value) -> Option<bool> {
+    // The field and nothing else. There is deliberately no second source to
+    // fall back to: the only other reading available was the "(Cached)" word in
+    // the stats summary, and that word answers a different question, so a
+    // fallback would turn "the plug-in did not say" into a confident wrong
+    // answer rather than into None. A goal that never passed through
+    // apply_cache_provenance carries no field, and unknown is the honest
+    // reading of that.
+    goal.get("from_cache")?.as_bool()
 }
 
-/// The reading straight off the summary, with no lifted field consulted.
+/// Set each goal's from_cache from the plug-in's answer, or null.
 ///
-/// Separate from goal_is_from_cache because the enrichment that writes the
-/// field must not read it: doing so made the first enrichment's answer
-/// permanent while the reader above treated it as authoritative, so a goal
-/// enriched before its stats arrived could never be corrected.
-fn summary_says_cached(goal: &serde_json::Value) -> bool {
-    goal.get("stats")
-        .and_then(|stats| stats.get("summary"))
-        .and_then(|summary| summary.as_str())
-        .is_some_and(|summary| summary.contains("(Cached)"))
+/// Called after every goal fetch, with the rows getGoalCacheStats returned.
+/// A goal the plug-in did not answer for gets null rather than no field, so a
+/// consumer reads "unknown" rather than falling back to a guess.
+pub fn apply_cache_provenance(goals: &mut [serde_json::Value], stats: &serde_json::Value) {
+    // The plug-in request is a signature request, so its named outputs arrive
+    // under "result"; a bare object is accepted too, which is what a unit test
+    // passes.
+    let stats = stats.get("result").unwrap_or(stats);
+    let rows = stats.get("goals").and_then(serde_json::Value::as_array);
+
+    // Indexed once rather than scanned per goal. The plug-in answers with one
+    // row per goal asked about, so a scan made this quadratic in the goal count
+    // on every fetch, and a whole-project run reaches a few thousand.
+    let by_wpo: std::collections::HashMap<&str, &serde_json::Value> = rows
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row.get("wpo")?.as_str()?, row)))
+        .collect();
+    for goal in goals.iter_mut() {
+        let answer = goal
+            .get("wpo")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|wpo| by_wpo.get(wpo))
+            .and_then(|row| row.get("best_result_cached").cloned());
+        if let Some(obj) = goal.as_object_mut() {
+            obj.insert(
+                "from_cache".to_string(),
+                answer.unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
 }
 
 pub fn enrich_goal_stable_id(
@@ -1147,20 +1173,13 @@ pub fn enrich_goal_stable_id(
 ) {
     let stable_goal_id = stable_goal_id_for(goal, goal_kind, stable_scope);
 
-    // Lifted onto the goal here because every goal passes through, so no
-    // consumer has to know it comes from a word in a free-form summary string.
-    //
-    // Written only where there is a summary to project, and overwritten rather
-    // than filled in. A goal with no stats yet gets no field, so it falls
-    // through to the summary read like an unenriched one instead of carrying an
-    // invented "false" that outranks a summary arriving later.
-    let summary_answer = goal.get("stats").is_some().then(|| summary_says_cached(goal));
+    // No from_cache here. It used to be projected out of the stats summary at
+    // this point, and that reading was wrong; apply_cache_provenance writes the
+    // field now, from the plug-in, on every goal fetch. Enriching it here too
+    // would give a goal two answers whose disagreement nothing could resolve.
     if let Some(obj) = goal.as_object_mut() {
         obj.entry("stable_goal_id".to_string())
             .or_insert_with(|| serde_json::Value::String(stable_goal_id));
-        if let Some(from_cache) = summary_answer {
-            obj.insert("from_cache".to_string(), serde_json::Value::Bool(from_cache));
-        }
         if let Some(name) = obj.get("name").cloned() {
             obj.entry("frama_c_goal_name".to_string()).or_insert(name);
         }
@@ -1305,6 +1324,17 @@ pub fn host_load() -> HostLoad {
 pub struct RunMeasurement {
     pub goals: usize,
     pub replayed: usize,
+
+    /// Goals whose provenance the plug-in did not report.
+    ///
+    /// A third bucket rather than a rounding of the other two. from_cache is
+    /// three-valued, and reading it as "replayed or not" put every unknown in
+    /// the not-replayed half, which reads as "this run computed it" and is the
+    /// flattering direction. coverage.rs already counts it this way and says
+    /// so; this counter is the same reading for the same field, so replayed
+    /// plus this can be short of goals rather than one half absorbing the
+    /// doubt.
+    pub replayed_unknown: usize,
     pub unproved: usize,
     pub unproved_replayed: usize,
 
@@ -1342,6 +1372,7 @@ impl RunMeasurement {
         json!({
             "goals": self.goals,
             "replayed": self.replayed,
+            "replayed_unknown": self.replayed_unknown,
             "unproved": self.unproved,
             "unproved_replayed": self.unproved_replayed,
             "timed_out": self.timed_out,
@@ -1355,6 +1386,7 @@ pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
     let mut measured = RunMeasurement {
         goals: goals.len(),
         replayed: 0,
+        replayed_unknown: 0,
         unproved: 0,
         unproved_replayed: 0,
         timed_out: 0,
@@ -1372,8 +1404,10 @@ pub fn run_measurement(goals: &[serde_json::Value]) -> RunMeasurement {
         // count. own_status also covers a row straight off the wire, which
         // carries "status" alone.
         let timed_out = crate::mcp::status::own_status_is_timeout(goal);
-        let cached = goal_is_from_cache(goal);
+        let provenance = goal_is_from_cache(goal);
+        let cached = provenance == Some(true);
         measured.replayed += usize::from(cached);
+        measured.replayed_unknown += usize::from(provenance.is_none());
         measured.unproved += usize::from(unproved);
         measured.unproved_replayed += usize::from(unproved && cached);
         measured.timed_out += usize::from(timed_out);
@@ -1456,19 +1490,30 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
     if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
-        if goal_is_from_cache(goal) {
-            return replayed_goal_triage("prover_timeout");
-        }
-        return wp_timeout_triage(
-            "prover_timeout",
-            true,
-            "high",
-            "The WP goal itself reports a prover timeout; a higher prover timeout may help.",
-            json!([
-                {"field": "normalized_status", "value": normalized_status},
-                {"field": "raw_status", "value": raw_status},
-            ]),
-        );
+        return match goal_is_from_cache(goal) {
+            Some(true) => replayed_goal_triage("prover_timeout"),
+            None => wp_timeout_triage(
+                "prover_timeout",
+                false,
+                "low",
+                "WP reports a prover timeout, but cache provenance is unavailable; refresh the goal before changing the timeout.",
+                json!([
+                    {"field": "from_cache", "value": serde_json::Value::Null},
+                    {"field": "normalized_status", "value": normalized_status},
+                    {"field": "raw_status", "value": raw_status},
+                ]),
+            ),
+            Some(false) => wp_timeout_triage(
+                "prover_timeout",
+                true,
+                "high",
+                "The WP goal itself reports a prover timeout; a higher prover timeout may help.",
+                json!([
+                    {"field": "normalized_status", "value": normalized_status},
+                    {"field": "raw_status", "value": raw_status},
+                ]),
+            ),
+        };
     }
     if matches!(normalized_status, "noresult" | "unknown")
         && matches!(
@@ -1500,7 +1545,7 @@ pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Valu
     // rather than appended to the classification's, because the reason on a
     // classification is per goal by design and a constant repeated per goal
     // belongs in neither half of the split.
-    if goal_is_from_cache(goal) {
+    if goal_is_from_cache(goal) == Some(true) {
         return replayed_goal_triage("none");
     }
     wp_timeout_triage_none()

@@ -175,6 +175,8 @@ const PARAMETER_REQUESTS: &[RequestSpec] = &[
     ("kernel", "kernel.parameters.setEvaPrecision", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaSlevel", ProbeKind::Set),
     ("kernel", "kernel.parameters.setEvaIlevel", ProbeKind::Set),
+    ("kernel", "kernel.parameters.setWarnUnsignedOverflow", ProbeKind::Set),
+    ("kernel", "kernel.parameters.setWarnUnsignedDowncast", ProbeKind::Set),
     ("kernel", "kernel.ast.compute", ProbeKind::Exec),
     ("kernel", "kernel.ast.setFiles", ProbeKind::Set),
 ];
@@ -259,6 +261,8 @@ fn probe_payload(request: &str) -> serde_json::Value {
         "kernel.parameters.setEvaSlevel" => json!(0),
         "plugins.ast-utils.getGoalCacheStats" => json!({"goals": []}),
         "kernel.parameters.setEvaIlevel" => json!(2),
+        "kernel.parameters.setWarnUnsignedOverflow"
+        | "kernel.parameters.setWarnUnsignedDowncast" => json!(true),
         // Probing it turns monitoring on, which is what we want anyway.
         "kernel.services.setLogs" => json!(true),
         "kernel.ast.compute"

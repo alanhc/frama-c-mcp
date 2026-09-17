@@ -1280,6 +1280,9 @@ pub struct WpRunResponse<'a> {
     pub functions: Vec<String>,
     pub scope: &'a str,
     pub rte_enabled: bool,
+    /// Whether that RTE includes the unsigned checks; false for a load with
+    /// rte_unsigned: false.
+    pub unsigned_rte: bool,
     pub frama_c_protocol: Vec<serde_json::Value>,
     pub proofread_report: Option<serde_json::Value>,
 
@@ -1300,6 +1303,7 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
         functions,
         scope,
         rte_enabled,
+        unsigned_rte,
         frama_c_protocol,
         proofread_report,
         goals,
@@ -1328,6 +1332,9 @@ pub fn wp_run_response(run: WpRunResponse<'_>) -> serde_json::Value {
     }
     if rte_enabled {
         frama_c_options.push("-wp-rte".to_string());
+        if unsigned_rte {
+            frama_c_options.extend(UNSIGNED_RTE_OPTIONS.iter().map(|option| option.to_string()));
+        }
     }
     if let Some(timeout) = timeout {
         frama_c_options.push("-wp-timeout".to_string());
@@ -1624,6 +1631,7 @@ pub fn cpp_extra_args(options: &ProjectLoadOptions) -> Option<String> {
         // generates WP's own RTE guards rather than the spawn asking the kernel
         // for its larger set.
         rte: _,
+        unsigned_rte_skipped: _,
     } = options;
 
     let flags = nostdinc
@@ -1682,6 +1690,17 @@ impl FramaCMcpServer {
         Err(unknown_verify_profile(name, &state.verification_profiles))
     }
 }
+
+/// The kernel options that make RTE generation check unsigned arithmetic.
+///
+/// Frama-C 33 defaults both to off, so -wp-rte alone generates no goal for
+/// unsigned wraparound or narrowing: "unsigned sub(unsigned a, unsigned b) {
+/// return a - b; }" gets none, and four with these on. rte: true is the claim
+/// that runtime errors were checked, and without them that claim silently
+/// excluded a class acsl-skills treats as part of its definition of done.
+/// Measured over the 55 fixtures: seven gain goals, and none that was fully
+/// proved stops being so.
+pub const UNSIGNED_RTE_OPTIONS: &[&str] = &["-warn-unsigned-overflow", "-warn-unsigned-downcast"];
 
 /// The argv for the long-lived main Frama-C process.
 ///
@@ -1742,8 +1761,10 @@ pub fn project_cli_args(options: &ProjectLoadOptions) -> Vec<String> {
         // themselves: wpcli passes -wp-rte where the run needs it, and
         // parse_surface runs no proof at all. The main spawn reaches this
         // through main_frama_c_args, whose doc carries the measurement for why
-        // the kernel's generator is the wrong one.
+        // the kernel's generator is the wrong one. The unsigned options travel
+        // with -wp-rte, from unsigned_rte_args, for the same reason.
         rte: _,
+        unsigned_rte_skipped: _,
     } = options;
 
     let mut args = Vec::new();
@@ -2091,6 +2112,33 @@ pub fn files_may_include(files: &[String]) -> bool {
     loaded_source_state(files, None).1
 }
 
+/// The TMPDIR a spawned Frama-C gets, under the server's short private root.
+///
+/// Frama-C cleans its temporary files at exit, but this server ends a Frama-C
+/// by killing its process group, so the exit handler never runs. Measured: one
+/// check from the CLI left five files in TMPDIR (the preprocessed .i and .pp,
+/// two cppannot/ppannot sources and a machdep directory), while plain frama-c
+/// over the same file left none. A directory per spawned process, removed with
+/// the process, contains them whatever happens to the process.
+///
+/// Under /tmp/fcmcp-<uid> rather than the server's own TMPDIR, because Why3
+/// puts its server socket there and a Unix socket path is capped near 104
+/// bytes: a TMPDIR as long as a test's scratch directory would fail the bind.
+pub fn frama_c_tmp_dir() -> std::io::Result<tempfile::TempDir> {
+    let root = crate::mcp::store::ensure_private_root()?;
+
+    // The owning pid is in the name so an orphan can be told from a directory
+    // in use. Drop removes this on a clean exit, but this server is itself
+    // killable, and a SIGKILL leaves the directory behind with nothing to say
+    // whose it was: measured, two such directories survived a kill -9 and eight
+    // older ones were already sitting under the private root. A random suffix
+    // alone cannot be swept, because no reader can tell which of them still
+    // belongs to a running server.
+    tempfile::Builder::new()
+        .prefix(&format!("tmp-{}-", std::process::id()))
+        .tempdir_in(root)
+}
+
 /// Start Frama-C on its own two logs, or leave neither behind.
 ///
 /// The logs are removed on every path that leaves without a MainFramaCState to
@@ -2100,6 +2148,7 @@ fn spawn_frama_c(
     command_line: &[String],
     stdout_log_path: &Path,
     stderr_log_path: &Path,
+    tmp_dir: &Path,
 ) -> Result<tokio::process::Child, McpError> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -2123,6 +2172,7 @@ fn spawn_frama_c(
     }
     cmd.stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
+        .env("TMPDIR", tmp_dir)
 
         // Its own process group, for the same reason the sandbox spawn takes
         // one: Frama-C starts why3server and the provers as its own children,
@@ -2261,6 +2311,9 @@ pub struct MainFramaCState {
     /// Recorded here rather than on the server so a respawn clears it, which
     /// is exactly when the next model becomes legal again.
     pub wp_model_used: Option<String>,
+    /// This process's TMPDIR, removed when the state is dropped, which is after
+    /// the process group has been killed. See frama_c_tmp_dir.
+    pub tmp_dir: tempfile::TempDir,
     /// Set when an in-place reload failed, meaning this process can no longer
     /// be trusted to hold a project.
     ///
@@ -2368,9 +2421,49 @@ pub struct ProjectLoadOptions {
     /// which declarations a file is compiled against, so two loads differing
     /// only here are different programs to prove.
     pub nostdinc: bool,
+
+    /// Whether rte generates no unsigned wraparound or narrowing obligations.
+    ///
+    /// For code whose idioms wrap by design, where acsl-skills measured the
+    /// two unsigned checks making 19 goals in 11 kernel string functions
+    /// unprovable by construction. Part of the load identity, because it
+    /// decides which obligations exist, and serialized only when set, so every
+    /// receipt made without it keeps the digest it had.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unsigned_rte_skipped: bool,
 }
 
 impl ProjectLoadOptions {
+    /// The options -wp-rte needs beside it on a command line for this load.
+    ///
+    /// Both halves of the predicate, and the load's rte rather than the
+    /// caller's: run_wp generates guards in place for a load that declined
+    /// rte, so a call site inside its own "if rte" is asking about this run
+    /// while the two kernel switches were decided at load time. Reading only
+    /// the skip flag gave a command-line probe the unsigned obligations the
+    /// session it was probing did not have. Same predicate as reload_project
+    /// sets the switches by.
+    pub fn unsigned_rte_args(&self) -> Vec<String> {
+        if self.unsigned_rte() {
+            UNSIGNED_RTE_OPTIONS.iter().map(|option| option.to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether this load generates unsigned wraparound and narrowing
+    /// obligations.
+    ///
+    /// The one spelling of the predicate. It was written out separately in
+    /// reload_project, where it decides the two kernel setters, in run_wp,
+    /// where it decides what the payload claims, and here, where it decides a
+    /// command line. Three copies of one boolean is how the socket setters and
+    /// the command-line probes come to disagree, which is the failure the
+    /// setters were moved to reload_project to prevent.
+    pub fn unsigned_rte(&self) -> bool {
+        self.rte && !self.unsigned_rte_skipped
+    }
+
     /// Whether these options pull in bytes that loaded_source_state never
     /// reads, which is what makes a parse record unusable for a later call.
     ///
@@ -2399,6 +2492,7 @@ impl ProjectLoadOptions {
             machdep: _,
             nostdinc: _,
             rte: _,
+            unsigned_rte_skipped: _,
         } = self;
         !force_includes.is_empty() || compilation_database.is_some()
     }
@@ -2828,11 +2922,18 @@ async fn apply_prover_selection(
     let is_requested = |id: &str| requested.iter().any(|name| prover_id_matches(name, id));
 
     // Nothing matching means every prover gets deselected, and WP then returns
-    // goals as `noresult` rather than failing, so the agent reads "goal not
+    // goals as "noresult" rather than failing, so the agent reads "goal not
     // valid" for what is really a misspelled prover name. Say which name.
-    if !ids.iter().copied().any(is_requested) {
+    //
+    // One unmatched name among matching ones is refused too. It used to be
+    // switched off without a word while effective_wp_config and the receipt
+    // went on listing it as effective, so FRAMAC_PROVERS=alt-ergo,cvc5 on a
+    // machine without cvc5 produced a proof attributed to a prover that never
+    // ran.
+    let unmatched = unmatched_provers(requested, &ids);
+    if !unmatched.is_empty() {
         return Err(McpError::invalid_params(
-            format!("no prover matches {requested:?}; this Frama-C offers {ids:?}"),
+            format!("no prover matches {unmatched:?}; this Frama-C offers {ids:?}"),
             None,
         ));
     }
@@ -2844,6 +2945,15 @@ async fn apply_prover_selection(
             .map_err(McpError::from)?;
     }
     Ok(())
+}
+
+/// The requested prover names that match none of the identifiers WP offers.
+pub fn unmatched_provers(requested: &[String], ids: &[&str]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|name| !ids.iter().any(|id| prover_id_matches(name, id)))
+        .cloned()
+        .collect()
 }
 
 /// Match a requested prover name against a WP prover identifier.
@@ -2905,16 +3015,22 @@ async fn start_wp_proofs(
     };
     let mut diagnostics = Vec::new();
     for decl_marker in decl_markers {
-        client
-            .get("kernel.ast.printDeclaration", json!(decl_marker))
-            .await
-            .map_err(McpError::from)?;
+        // A property marker proves that property alone: WP's startProofs sends
+        // it to VC.generate_ip, where a declaration goes to VC.generate_kf and
+        // generates every goal of the function. run_wp passes property markers
+        // when prop narrowed the run, and has already printed the enclosing
+        // declarations, which is what registers the markers in the tag table.
+        let marker = if decl_marker.starts_with("#p") {
+            decl_marker.clone()
+        } else {
+            client
+                .get("kernel.ast.printDeclaration", json!(decl_marker))
+                .await
+                .map_err(McpError::from)?;
+            pvdecl_marker(decl_marker)?
+        };
         let proof = client
-            .exec_with_diagnostics(
-                "plugins.wp.startProofs",
-                json!(pvdecl_marker(decl_marker)?),
-                WP_PROOF_BUDGET,
-            )
+            .exec_with_diagnostics("plugins.wp.startProofs", json!(marker), WP_PROOF_BUDGET)
             .await
             .map_err(McpError::from)?;
         diagnostics.push(json!(proof.diagnostics));
@@ -3161,6 +3277,8 @@ impl FramaCMcpServer {
             self.frama_c_path.clone(),
             sandbox_file.display().to_string(),
             "-rte".to_string(),
+            UNSIGNED_RTE_OPTIONS[0].to_string(),
+            UNSIGNED_RTE_OPTIONS[1].to_string(),
             "-keep-unused-functions".to_string(),
             "all".to_string(),
             "-keep-unused-types".to_string(),
@@ -3199,6 +3317,10 @@ impl FramaCMcpServer {
         // Restore existing conclusions from .frama-c-mcp/ when session starts,
         // and drop any in-flight write a previous run died holding.
         crate::mcp::store::sweep_writer_temp_files(&conclusion_base_dir());
+
+        // Beside it, and for the same reason: both are scratch a killed process
+        // could not clean up after itself.
+        crate::mcp::store::sweep_orphaned_frama_c_tmp_dirs();
         let loaded = load_conclusions_from_disk(&conclusion_base_dir());
         if !loaded.is_empty() {
             let state_clone = state.clone();
@@ -3377,7 +3499,15 @@ impl FramaCMcpServer {
             return self
                 .run_isolated_wp_retries(IsolatedWpRetry {
                     files: vec![metadata.sandbox_dir.join("sandbox.c").display().to_string()],
-                    project_options: ProjectLoadOptions::default(),
+
+                    // Sandboxes always enable RTE, including its unsigned
+                    // checks. The isolated retry has no loaded project to
+                    // inherit that setting from, so describe the sandbox's
+                    // actual mode explicitly.
+                    project_options: ProjectLoadOptions {
+                        rte: true,
+                        ..ProjectLoadOptions::default()
+                    },
                     rte_enabled: true,
                     functions: target_names,
                     reported_functions: names.clone(),
@@ -3478,12 +3608,7 @@ impl FramaCMcpServer {
 
         let tasks = drain_wp_tasks(&client, WP_DRAIN_BUDGET).await?;
         let report_function = (names.len() == 1).then(|| target_names[0].as_str());
-        let wp_goals = reload_fetch(
-            &client,
-            "plugins.wp.reloadGoals",
-            "plugins.wp.fetchGoals",
-        )
-        .await?;
+        let wp_goals = crate::mcp::server::analysis::fetch_wp_goals(&client).await?;
         let proofread_report = proofread_report_from_wp_goals(&wp_goals, report_function);
         let source_files = {
             let sandboxes = self.sandboxes.read().await;
@@ -3499,6 +3624,7 @@ impl FramaCMcpServer {
             functions: names.clone(),
             scope: "sandbox",
             rte_enabled: true,
+            unsigned_rte: true,
             frama_c_protocol: protocol_diagnostics,
             proofread_report: Some(proofread_report),
             goals: Some(wp_goals.as_slice()),
@@ -3532,21 +3658,27 @@ impl FramaCMcpServer {
         // The property table the receipt reads is the sandbox's own, which is
         // the only difference from the main path.
         //
-        // Defaults, matching what sandbox_frama_c_command_line passes the
-        // sandbox's own process. The narrowing to what a printed AST can use
-        // happens inside the probe rather than here, so if that command line
-        // ever gains the project's machine model this call inherits the same
-        // treatment instead of needing to be remembered.
+        // Matching what sandbox_frama_c_command_line passes the sandbox's own
+        // process: defaults, except that the sandbox always runs with RTE and
+        // its unsigned checks, and a default load has rte false, which made the
+        // probe drop the unsigned options its process had. The narrowing to
+        // what a printed AST can use happens inside the probe rather than here,
+        // so if that command line ever gains the project's machine model this
+        // call inherits the same treatment instead of needing to be remembered.
         self.attach_probe_and_receipt(crate::mcp::server::analysis::ProbeAndReceipt {
             client: &client,
             response: &mut response,
-            project_options: &ProjectLoadOptions::default(),
+            project_options: &ProjectLoadOptions {
+                rte: true,
+                ..ProjectLoadOptions::default()
+            },
             rte: true,
             probe_functions: &probe_functions,
             temp_dir_prefix: "frama-c-mcp-sandbox-probe-ast-",
             source_files,
             wp_goals: &wp_goals,
             report_function,
+            smoke: crate::mcp::server::analysis::smoke_requested(params),
         })
         .await?;
         Ok(json_result(response))
@@ -3674,12 +3806,22 @@ impl FramaCMcpServer {
         })?;
 
         let command_line = self.sandbox_frama_c_command_line(sandbox_file, socket);
+
+        // Inside the sandbox's own directory, so it goes when the sandbox does
+        // and adds no second thing to clean up. That directory already lives
+        // under the short private root, which keeps the why3 server's socket
+        // path inside the ~108 byte limit.
+        let tmp_dir = log_dir.join("tmp");
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+            McpError::internal_error(format!("failed to create sandbox TMPDIR: {e}"), None)
+        })?;
         let mut cmd = Command::new(&command_line[0]);
         for arg in &command_line[1..] {
             cmd.arg(arg);
         }
         cmd.stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(stderr_log))
+            .env("TMPDIR", &tmp_dir)
 
             // Its own process group, so cleanup can kill the group rather than
             // the pid. Frama-C's why3server runs in Frama-C's group and
@@ -3878,7 +4020,11 @@ impl FramaCMcpServer {
 
         let command_line =
             self.main_frama_c_command_line(&new_files, &new_project_options, &socket_path);
-        let mut child = spawn_frama_c(&command_line, &stdout_log_path, &stderr_log_path)?;
+        let tmp_dir = frama_c_tmp_dir().map_err(|error| {
+            McpError::internal_error(format!("create a TMPDIR for frama-c: {error}"), None)
+        })?;
+        let mut child =
+            spawn_frama_c(&command_line, &stdout_log_path, &stderr_log_path, tmp_dir.path())?;
         let pid = child.id().unwrap_or_default();
 
         // Waiting for the socket and connecting are one step: the file exists
@@ -3970,6 +4116,7 @@ impl FramaCMcpServer {
             // already-recorded location resolve somewhere else.
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             wp_model_used: None,
+            tmp_dir,
             poisoned,
         });
         *client_lock = Some(Arc::new(new_client));
@@ -4164,15 +4311,23 @@ pub fn semantic_suggestions_for_vc(
         }));
     }
 
-    if vc_prover_statuses(vc)
-        .iter()
-        .any(|status| matches!(status.as_str(), "unknown" | "stepout"))
-    {
+    // Unknown and Stepout used to share one suggestion that sent the reader to
+    // smoke tests for a contradiction. Contradictory hypotheses make a goal
+    // valid, not Unknown, and smoke tests look for vacuity among proved goals,
+    // so that advice pointed at the one cause these statuses rule out.
+    let statuses = vc_prover_statuses(vc);
+    if statuses.iter().any(|status| status == "unknown") {
         suggestions.push(json!({
-            "kind": "check_vacuity_or_contradiction",
-            "message": "A prover returned Unknown/Stepout rather than timeout; check for vacuity or contradiction in the hypotheses before only increasing timeout.",
+            "kind": "unknown_missing_hypothesis",
+            "message": "A prover returned Unknown: it gave up without deciding, which usually means a fact the goal needs is not among its hypotheses rather than that it needs more time. Compare the hypotheses with the conclusion and strengthen the requires, loop invariant or callee ensures that should supply the missing fact.",
+            "next_tool": "get_wp_goals",
+        }));
+    }
+    if statuses.iter().any(|status| status == "stepout") {
+        suggestions.push(json!({
+            "kind": "stepout_goal_too_large",
+            "message": "A prover ran out of steps, which is a timeout by another budget: the goal is too large or nonlinear for it. Split it with a guiding assert or a smaller function, try another prover, or raise the step limit.",
             "next_tool": "run_wp",
-            "next_args": {"smoke": true, "provers": ["Alt-Ergo"]},
         }));
     }
 
@@ -4616,7 +4771,10 @@ use receipt::{
 pub mod eacsl;
 #[path = "wpcli.rs"]
 pub mod wpcli;
-use wpcli::{run_wp_counter_examples, run_wp_memory_model_probe, run_why3_dump, run_wp_print, IsolatedWpRetry};
+use wpcli::{
+    run_why3_dump, run_wp_counter_examples, run_wp_memory_model_probe, run_wp_print,
+    run_wp_smoke_probe, IsolatedWpRetry, SmokeProbeRequest,
+};
 use eacsl::run_e_acsl_counterexample;
 
 #[path = "selfcheck.rs"]

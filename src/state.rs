@@ -78,6 +78,7 @@ pub fn proof_receipt_evidence_error(
     let Some(files) = receipt.pointer("/subject/files").and_then(|v| v.as_array()) else {
         return Some("proof_receipt does not carry a source file list".to_string());
     };
+
     // Readability only. Whether subject.source_hash agrees with these entries
     // is not asked, because the whole-receipt digest above already covers both
     // of them: a receipt whose outer hash matches is byte-identical to what the
@@ -110,14 +111,15 @@ pub fn proof_receipt_evidence_error(
     if goals.len() as u32 != goal_total {
         return Some("proof_receipt goal count does not match wp_summary".to_string());
     }
+
     // Not a status scan. A goal discharged only because its hypotheses cannot
-    // hold is stamped valid like any other, so a contract weakened to
-    // "requires \false" produced an all-valid receipt, a wp_summary whose
-    // valid equals its total, and a conclusion that stored and reloaded as
-    // Verified. get_wp_goals refuses to call that progress; refusing it here
-    // too is what stops the durable artifact from being the laxer of the pair,
-    // which is the wrong way round: a diff is read once, a conclusion persists
-    // to disk and is believed again next session.
+    // hold is stamped valid like any other, so a contract weakened to "requires
+    // \false" produced an all-valid receipt, a wp_summary whose valid equals
+    // its total, and a conclusion that stored and reloaded as Verified.
+    // get_wp_goals refuses to call that progress; refusing it here too is what
+    // stops the durable artifact from being the laxer of the pair, which is the
+    // wrong way round: a diff is read once, a conclusion persists to disk and
+    // is believed again next session.
     //
     // Receipts written before the field carry no vacuously_proved key and read
     // as false, so this tightens on new evidence and leaves old evidence
@@ -126,6 +128,75 @@ pub fn proof_receipt_evidence_error(
         return Some(
             "proof_receipt goals are not all discharged; a goal is unproved, or proved only \
              under hypotheses that cannot hold"
+                .to_string(),
+        );
+    }
+
+    // A run narrowed by prop proved the properties it selected and never
+    // attempted the rest, so it is not evidence about the function whatever
+    // the goals it did prove came back as. The two completeness tests above
+    // cannot see it: retain_selected_goals drops the unselected goals before
+    // the receipt is written and wp_summary counts the narrowed set, so the
+    // count matches itself and every goal in it is progress.
+    //
+    // Here rather than at the caller, for the reason the vacuity paragraph
+    // above gives. check reports the same narrowing as CHECK_NARROWED_BY_PROP
+    // and that entry is read once, while a conclusion persists to disk and is
+    // believed again next session; the durable artifact must not be the laxer
+    // of the two. store_conclusion and the profile path both arrive here, so
+    // one refusal covers them.
+    // The soundness gates live in check, so only a check receipt can say they
+    // ran and found nothing. A run_wp receipt records goals, a failure kind and
+    // a timeout triage, and none of those sees an invented callee contract, a
+    // skipped function, a dropped annotation, an unsound encoding, a weakened
+    // model, a reduced RTE set or a failed smoke test. Measured on
+    // tests/fixtures/generated-callee-spec.c: check reports GENERATED_CALLEE_SPEC
+    // and is incomplete, while run_wp proves 7 of 7 and the same receipt stored
+    // as verified, after which proof_coverage answered "complete" at 100%. That
+    // is the whole gate set bypassed by the one route whose answer persists.
+    //
+    // The documented Definition of Done already says this: "check {function}
+    // leaves incomplete[] empty", and "a green goal count is not it". This is
+    // that rule enforced rather than only written down. It lives here for the
+    // reason the paragraphs above do, so store_conclusion and the profile path
+    // inherit one refusal instead of each remembering.
+    if receipt.pointer("/subject/tool").and_then(|tool| tool.as_str()) != Some("check") {
+        return Some(
+            "proof_receipt was not produced by check, so it did not run the soundness gates; \
+             store the receipt from a check whose incomplete[] is empty."
+                .to_string(),
+        );
+    }
+    match receipt
+        .pointer("/reported/verdict")
+        .and_then(|verdict| verdict.as_str())
+    {
+        Some("proved") => {}
+        Some(other) => {
+            return Some(format!(
+                "proof_receipt records a check verdict of {other:?} rather than \"proved\", so \
+                 the run it describes found something still outstanding."
+            ));
+        }
+        None => {
+            return Some(
+                "proof_receipt records no check verdict, so it comes from run_wp, which does not \
+                 run the soundness gates: an invented callee contract, a skipped function or \
+                 annotation, an unsound encoding and a failed smoke test are all invisible to it. \
+                 Store the receipt from a check whose incomplete[] is empty."
+                    .to_string(),
+            );
+        }
+    }
+
+    if receipt
+        .pointer("/wp/prop/effective")
+        .is_some_and(|prop| !prop.is_null())
+    {
+        return Some(
+            "proof_receipt comes from a run narrowed by prop, which proved the selected \
+             properties and attempted none of the others. Re-run without prop before storing \
+             a conclusion."
                 .to_string(),
         );
     }
@@ -355,6 +426,13 @@ pub struct VerificationProfile {
     /// strictly smaller set. Without this field a caller could pass rte:false
     /// and have the thinner run recorded as this target's evidence.
     pub rte: Option<bool>,
+
+    /// Whether the target's rte checks unsigned wraparound and narrowing.
+    ///
+    /// Unset and true both mean checked. False records a codebase whose idioms
+    /// wrap by design, and a run under it reports RTE_REDUCED.
+    #[serde(default)]
+    pub rte_unsigned: Option<bool>,
 
     /// The command that makes this target's verdict outside this server.
     ///

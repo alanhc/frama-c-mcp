@@ -2117,6 +2117,120 @@ fn tool_router_matches_the_documented_surface() {
     assert_eq!(registered, documented);
 }
 
+/// The Markdown an agent reads to learn the tool surface: README, the docs and
+/// the shipped skill. docs/design holds proposals, which may name tools that do
+/// not exist yet, so it is left out.
+fn agent_facing_markdown(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = vec![root.join("README.md")];
+    let mut docs = std::fs::read_dir(root.join("docs"))
+        .expect("docs/")
+        .map(|entry| entry.expect("docs entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect::<Vec<_>>();
+    docs.sort();
+    files.extend(docs);
+    source_files(&root.join("skills"), "md", &mut files);
+    files
+}
+
+/// Every tool an agent-facing document calls exists.
+///
+/// tool_router_matches_the_documented_surface reads README's Tools table and
+/// nothing else, so the shipped skill drifted without a failure: its SKILL.md
+/// and references told agents to call get_eva_alarms, investigate_alarm and
+/// get_verification_status, none of which the router has ever registered, from
+/// the commit that imported the skill onward. An agent following it gets an
+/// unknown-tool error on its second call.
+///
+/// A call is written "name {args}" or "name({args})" throughout these files,
+/// and that shape is what is matched. Fenced blocks in a programming language
+/// are skipped: C, Rust and shell have "ident {" of their own.
+#[test]
+fn documented_tool_calls_name_registered_tools() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let registered = FramaCMcpServer::tool_router()
+        .list_all()
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<BTreeSet<_>>();
+    let call = regex::Regex::new(r#"(?:^|[^\w.\\!"'-])([a-z][a-z0-9_]*)(?: \{|\(\{)"#).unwrap();
+    let code_languages = ["c", "cpp", "rust", "sh", "bash", "shell", "console", "ocaml", "json", "toml", "yaml", "make", "diff"];
+
+    let mut seen = BTreeSet::new();
+    let mut unknown = Vec::new();
+    for path in agent_facing_markdown(root) {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let mut fence: Option<String> = None;
+        for (index, line) in text.lines().enumerate() {
+            if let Some(info) = line.trim_start().strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(info.trim().to_ascii_lowercase()),
+                };
+                continue;
+            }
+            if fence.as_deref().is_some_and(|lang| code_languages.contains(&lang)) {
+                continue;
+            }
+            for capture in call.captures_iter(line) {
+                let name = &capture[1];
+                seen.insert(name.to_string());
+                if !registered.contains(name) {
+                    let shown = path.strip_prefix(root).unwrap_or(&path).display();
+                    unknown.push(format!("{shown}:{}: {name}", index + 1));
+                }
+            }
+        }
+    }
+
+    // A scan that matched nothing would pass on any tree.
+    assert!(seen.contains("check") && seen.contains("run_wp"), "the scan found no tool calls: {seen:?}");
+    assert!(unknown.is_empty(), "documents call tools the router does not register:\n{}", unknown.join("\n"));
+}
+
+/// The shipped skill's worked example is the measured fixture, byte for byte.
+///
+/// skills/frama-c-proofreader/examples/abs-int quotes goal counts for its two
+/// files, and scripts/check-abs-int-fixtures.sh measures those counts on every
+/// CI run, but for tests/fixtures/abs-int-*.c. Nothing tied the two copies
+/// together, so an edit to either would leave the skill quoting numbers for a
+/// file CI no longer checks.
+#[test]
+fn skill_examples_match_the_measured_fixtures() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (example, fixture) in [
+        ("skills/frama-c-proofreader/examples/abs-int/abs-buggy.c", "tests/fixtures/abs-int-buggy.c"),
+        ("skills/frama-c-proofreader/examples/abs-int/abs-fixed.c", "tests/fixtures/abs-int-fixed.c"),
+    ] {
+        let example_bytes = std::fs::read(root.join(example)).expect(example);
+        let fixture_bytes = std::fs::read(root.join(fixture)).expect(fixture);
+        assert!(example_bytes == fixture_bytes, "{example} differs from {fixture}");
+    }
+}
+
+/// No agent-facing document names one machine's home directory.
+///
+/// The skill's WP and E-ACSL references quoted /Users/jserv/.opam/... paths,
+/// one of them in a Frama-C 31 switch below the supported floor, so a reader
+/// on any other machine got commands that could not run and output measured
+/// on a toolchain the project does not support.
+#[test]
+fn agent_facing_documents_carry_no_home_directory_paths() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = regex::Regex::new(r"(?:/Users/|/home/)[A-Za-z0-9_.-]+/").unwrap();
+    let mut found = Vec::new();
+    for path in agent_facing_markdown(root) {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        for (index, line) in text.lines().enumerate() {
+            if home.is_match(line) {
+                let shown = path.strip_prefix(root).unwrap_or(&path).display();
+                found.push(format!("{shown}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(found.is_empty(), "machine-specific paths:\n{}", found.join("\n"));
+}
+
 
 /// A job that runs a script out of the tree checks the tree out first.
 ///

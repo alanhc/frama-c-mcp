@@ -3,7 +3,7 @@ set -euo pipefail
 
 skillDir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 framaC="${FRAMA_C_BIN:-$(command -v frama-c || true)}"
-eacsl="${EACSL_BIN:-$(command -v e-acsl-gcc.sh || command -v e-acsl-gcc || true)}"
+eacsl="${EACSL_BIN:-$(command -v e-acsl-gcc || command -v e-acsl-gcc.sh || true)}"
 failed=0
 
 pass()
@@ -30,7 +30,7 @@ if [ -z "$framaC" ]; then
     fail "frama-c not found; set FRAMA_C_BIN"
 else
     "$framaC" -version
-    buggyOut="$("$framaC" -wp -wp-rte "$skillDir/examples/abs-int/abs-buggy.c" 2>&1 || true)"
+    buggyOut="$("$framaC" -wp -wp-rte -wp-cache none "$skillDir/examples/abs-int/abs-buggy.c" 2>&1 || true)"
     if printf '%s\n' "$buggyOut" | grep -q 'typed_abs_int_assert_rte_signed_overflow' \
         && printf '%s\n' "$buggyOut" | grep -qE 'Proved goals:[[:space:]]*9[[:space:]]*/[[:space:]]*10'; then
         pass "WP reports abs-buggy signed-overflow proof gap"
@@ -39,7 +39,7 @@ else
         fail "WP output for abs-buggy changed"
     fi
 
-    fixedOut="$("$framaC" -wp -wp-rte "$skillDir/examples/abs-int/abs-fixed.c" 2>&1 || true)"
+    fixedOut="$("$framaC" -wp -wp-rte -wp-cache none "$skillDir/examples/abs-int/abs-fixed.c" 2>&1 || true)"
     if printf '%s\n' "$fixedOut" | grep -qE 'Proved goals:[[:space:]]*14[[:space:]]*/[[:space:]]*14'; then
         pass "WP proves abs-fixed"
     else
@@ -55,7 +55,7 @@ else
     trap 'rm -rf "$workDir"' EXIT
     cp "$skillDir/examples/abs-int/abs-buggy.c" "$workDir/abs-buggy.c"
     set +e
-    compileOut="$(cd "$workDir" && "$eacsl" abs-buggy.c 2>&1)"
+    compileOut="$(cd "$workDir" && "$eacsl" -c abs-buggy.c 2>&1)"
     compileStatus=$?
     set -e
     if [ "$compileStatus" -ne 0 ]; then

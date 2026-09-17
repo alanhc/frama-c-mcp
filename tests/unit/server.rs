@@ -1669,12 +1669,29 @@ fn semantic_suggestions_port_unknown_and_modular_rules() {
     let suggestions = semantic_suggestions_for_vc(&vc, &[]);
     assert!(suggestions
         .iter()
-        .any(|suggestion| suggestion["kind"] == "check_vacuity_or_contradiction"
-            && suggestion["next_tool"] == "run_wp"
-            && suggestion["next_args"]["smoke"] == true));
+        .any(|suggestion| suggestion["kind"] == "unknown_missing_hypothesis"
+            && suggestion["next_tool"] == "get_wp_goals"));
+
+    // The old single suggestion routed Unknown to smoke tests, which look for
+    // vacuity among proved goals: the one cause an Unknown rules out.
+    assert!(suggestions
+        .iter()
+        .all(|suggestion| suggestion["next_args"]["smoke"] != true));
     assert!(suggestions
         .iter()
         .any(|suggestion| suggestion["kind"] == "decompose_modular_multiplication"));
+
+    // Stepout is a budget running out, so it is advised like a timeout and not
+    // like a missing hypothesis.
+    let stepout = json!({
+        "prover_result": {"normalized_status": "stepout"},
+        "wp_print": {"hypotheses": [], "conclusion": "x >= 0"}
+    });
+    let kinds = semantic_suggestions_for_vc(&stepout, &[])
+        .iter()
+        .map(|suggestion| suggestion["kind"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["stepout_goal_too_large"]);
 
     let property_unknown_only = json!({
         "normalized_status": "unknown",
@@ -1727,7 +1744,7 @@ fn enrich_semantic_suggestions_updates_failure_classification() {
     enrich_semantic_suggestions(&mut vcs, &[]);
     assert_eq!(
         vcs[0]["failure_classification"]["semantic_suggestions"][0]["kind"],
-        "check_vacuity_or_contradiction"
+        "unknown_missing_hypothesis"
     );
     assert!(vcs[0].get("semantic_suggestions").is_none(), "{vcs:?}");
 }

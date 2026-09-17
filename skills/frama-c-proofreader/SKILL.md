@@ -18,12 +18,15 @@ check {function?, timeout?}
 If `check` reports alarms or non-valid goals, inspect the concrete payload before changing code:
 
 ```text
-get_eva_alarms {function?, status?}
-investigate_alarm {property_key, depth}
+get_wp_goals {want: ["alarms"], function?, status?}
+get_wp_goals {want: ["investigation"], marker, depth}
 get_wp_goals {function, status?}
-get_wp_goals {function, detail: true}
 context {function, want: ["current_annotations", "function_ast"]}
 ```
+
+`investigation` takes the property marker off an alarm or goal row. A `check`
+payload is not proved while `incomplete[]` has any entry; read each entry's
+guidance before treating a valid goal as evidence.
 
 Validate candidate ACSL with dry-run injection first:
 
@@ -47,6 +50,8 @@ Always separate these outcomes:
 - Proven under assumptions: WP proved the generated goals for the ACSL and RTE configuration that actually ran.
 
 Do not claim proof without tool output. Report exact goal names, proof counts, and whether `rte: true` or `-wp-rte` was used.
+
+Before calling a function verified, run `check {files, smoke: true}` and confirm there is no `SMOKE_TEST_FAILED`: a contradictory `requires` or dead code makes every goal in scope provable, and only smoke tests notice.
 
 ## Boundaries
 

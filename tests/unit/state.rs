@@ -1533,6 +1533,156 @@ fn a_conclusion_written_before_profiles_still_loads() {
 }
 
 #[test]
+fn a_sandbox_whose_socket_path_would_not_fit_is_refused_with_the_measurement() {
+    // is_safe_path_segment accepts an experiment_id of 128, and the sandbox's
+    // socket is "frama-c.sock" inside a directory carrying that id, so the two
+    // limits disagree and the socket one wins at connect time. Measured before
+    // this guard: a 100 character id created the directory and then failed with
+    // "path must be shorter than SUN_LEN", naming neither the id nor the cap.
+    use std::path::PathBuf;
+    let root = PathBuf::from("/tmp/fcmcp-1000");
+
+    let short = root.join("sb-0123abcd-exp1");
+    assert!(
+        frama_c_mcp::mcp::store::sandbox_socket_path_error(&short).is_ok(),
+        "an ordinary sandbox was refused"
+    );
+
+    let long = root.join(format!("sb-0123abcd-{}", "e".repeat(100)));
+    let refused = frama_c_mcp::mcp::store::sandbox_socket_path_error(&long)
+        .expect_err("a 100 character id must be refused");
+    let message = format!("{refused:?}");
+    #[cfg(target_os = "macos")]
+    let socket_limit = "104";
+    #[cfg(not(target_os = "macos"))]
+    let socket_limit = "108";
+    assert!(
+        message.contains("too long") && message.contains(socket_limit),
+        "the refusal does not say what the limit is: {message}"
+    );
+}
+
+#[test]
+fn an_orphaned_frama_c_tmp_dir_is_swept_and_a_live_one_is_kept() {
+    // frama_c_tmp_dir removes its directory on Drop, which a SIGKILL never
+    // runs, so the directory outlives the server with no owner. The name
+    // carries the owning pid precisely so an orphan can be told from a
+    // directory still in use; age cannot, because a long proof and an orphan
+    // look alike.
+    let root = tempfile::tempdir().expect("tempdir");
+
+    // A pid that cannot be running: 0 is never a user process, and kill(0, 0)
+    // addresses the caller's own group rather than a process, so the sweep
+    // treats it as gone.
+    let orphan = root.path().join("tmp-0-abcdef");
+    let mine = root.path().join(format!("tmp-{}-abcdef", std::process::id()));
+
+    // Old-format names carry no pid and are left alone rather than guessed at.
+    let legacy = root.path().join("tmp-XXXXXX");
+    for dir in [&orphan, &mine, &legacy] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+
+    frama_c_mcp::mcp::store::sweep_orphaned_frama_c_tmp_dirs_in(root.path());
+
+    assert!(!orphan.exists(), "an orphan was left behind");
+    assert!(mine.exists(), "the sweep removed a directory still in use");
+    assert!(legacy.exists(), "an unattributable directory was guessed at");
+}
+
+#[test]
+fn a_run_wp_receipt_is_not_evidence_for_a_verified_conclusion() {
+    // The soundness gates live in check. A run_wp receipt records goals, a
+    // failure kind and a timeout triage, none of which sees an invented callee
+    // contract, a skipped function, a dropped annotation, an unsound encoding
+    // or a failed smoke test. Measured on generated-callee-spec.c: check
+    // reports GENERATED_CALLEE_SPEC and is incomplete, while run_wp proved 7 of
+    // 7 and that receipt stored as verified, after which proof_coverage
+    // answered "complete" at 100%.
+    let receipt = |reported: serde_json::Value| {
+        frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
+            frama_c_mcp::mcp::server::receipt::proof_receipt_body(
+                frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
+                    tool: "check",
+                    source_files: vec![json!({"path": "f.c", "sha256": "h"})],
+                    project_load: json!({}),
+                    ast_digest: json!("ast"),
+                    ast_digest_unavailable_reason: json!(null),
+                    contracts: json!({}),
+                    environment: json!({"frama_c_version": "33.0"}),
+                    wp_config: json!({"functions": ["f"]}),
+                    eva_config: json!({}),
+                    goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+                    goals_status_source: "wp_fetch_goals",
+                    reported,
+                },
+            ),
+        )
+    };
+
+    // A check receipt without its verdict is not conclusion evidence.
+    let refused = proof_receipt_evidence_error(&receipt(json!({"failure_kind": "none"})), 1, "f");
+    assert!(
+        refused.as_deref().is_some_and(|m| m.contains("no check verdict")),
+        "a run_wp receipt was accepted as verified evidence: {refused:?}"
+    );
+
+    // A check that did not come back proved is refused for what it says.
+    let incomplete = proof_receipt_evidence_error(&receipt(json!({"verdict": "incomplete"})), 1, "f");
+    assert!(
+        incomplete.as_deref().is_some_and(|m| m.contains("incomplete")),
+        "an unproved check receipt was accepted: {incomplete:?}"
+    );
+
+    // And the sanctioned path still stores.
+    assert_eq!(
+        proof_receipt_evidence_error(&receipt(json!({"verdict": "proved"})), 1, "f"),
+        None
+    );
+}
+
+#[test]
+fn a_receipt_from_a_prop_narrowed_run_is_not_conclusion_evidence() {
+    // check reports the narrowing as CHECK_NARROWED_BY_PROP, and that entry is
+    // read once; a conclusion persists and is believed again next session, so
+    // the durable artifact must not be the laxer of the two. The two
+    // completeness tests cannot see this on their own: retain_selected_goals
+    // drops the unselected goals before the receipt is written and wp_summary
+    // counts what is left, so the count matches itself and every goal in it is
+    // progress.
+    let narrowed = |prop: serde_json::Value| {
+        frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
+            frama_c_mcp::mcp::server::receipt::proof_receipt_body(
+                frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
+                    tool: "check",
+                    source_files: vec![json!({"path": "f.c", "sha256": "h"})],
+                    project_load: json!({}),
+                    ast_digest: json!("ast"),
+                    ast_digest_unavailable_reason: json!(null),
+                    contracts: json!({}),
+                    environment: json!({"frama_c_version": "33.0"}),
+                    wp_config: json!({"functions": ["f"], "prop": {"effective": prop}}),
+                    eva_config: json!({}),
+                    goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
+                    goals_status_source: "wp_fetch_goals",
+                    reported: json!({"verdict": "proved"}),
+                },
+            ),
+        )
+    };
+
+    let refused = proof_receipt_evidence_error(&narrowed(json!("two")), 1, "f");
+    assert!(
+        refused.as_deref().is_some_and(|message| message.contains("narrowed by prop")),
+        "a narrowed receipt was accepted as evidence: {refused:?}"
+    );
+
+    // The same receipt without the filter still stores, so this refuses the
+    // narrowing rather than the shape.
+    assert_eq!(proof_receipt_evidence_error(&narrowed(json!(null)), 1, "f"), None);
+}
+
+#[test]
 fn a_receipt_that_proves_another_function_is_not_this_one_s_evidence() {
     // profile_evidence_error asks this, and only when a verify_profile is in
     // play. Without one, a receipt from proving "g" satisfied every other check
@@ -1541,7 +1691,7 @@ fn a_receipt_that_proves_another_function_is_not_this_one_s_evidence() {
     let receipt = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
         frama_c_mcp::mcp::server::receipt::proof_receipt_body(
             frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
-                tool: "run_wp",
+                tool: "check",
                 source_files: vec![json!({"path": "g.c", "sha256": "h"})],
                 project_load: json!({}),
                 ast_digest: json!("ast"),
@@ -1552,7 +1702,7 @@ fn a_receipt_that_proves_another_function_is_not_this_one_s_evidence() {
                 eva_config: json!({}),
                 goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
                 goals_status_source: "wp_fetch_goals",
-                reported: json!({}),
+                reported: json!({"verdict": "proved"}),
             },
         ),
     );
@@ -1593,7 +1743,7 @@ fn a_receipt_recording_no_functions_is_refused_and_the_loader_agrees() {
     let anonymous = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
         frama_c_mcp::mcp::server::receipt::proof_receipt_body(
             frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
-                tool: "run_wp",
+                tool: "check",
                 source_files: vec![json!({"path": "anon.c", "sha256": "h"})],
                 project_load: json!({}),
                 ast_digest: json!("ast"),
@@ -1604,7 +1754,7 @@ fn a_receipt_recording_no_functions_is_refused_and_the_loader_agrees() {
                 eva_config: json!({}),
                 goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
                 goals_status_source: "wp_fetch_goals",
-                reported: json!({}),
+                reported: json!({"verdict": "proved"}),
             },
         ),
     );
@@ -1660,7 +1810,7 @@ fn a_sandbox_receipt_is_never_evidence_for_a_main_project_conclusion() {
     let sandboxed = frama_c_mcp::mcp::server::receipt::proof_receipt_with_hash(
         frama_c_mcp::mcp::server::receipt::proof_receipt_body(
             frama_c_mcp::mcp::server::receipt::ProofReceiptBody {
-                tool: "run_wp",
+                tool: "check",
                 source_files: vec![json!({"path": "sandbox.c", "sha256": "h"})],
                 project_load: json!({}),
                 ast_digest: json!("ast"),
@@ -1674,7 +1824,7 @@ fn a_sandbox_receipt_is_never_evidence_for_a_main_project_conclusion() {
                 eva_config: json!({}),
                 goals: vec![json!({"stable_goal_id": "g0", "status": "valid"})],
                 goals_status_source: "wp_fetch_goals",
-                reported: json!({}),
+                reported: json!({"verdict": "proved"}),
             },
         ),
     );

@@ -419,6 +419,85 @@ pub fn expected_sandbox_dir(base_dir: &Path, experiment_id: &str) -> PathBuf {
     private_root_path().join(format!("sb-{owner}-{experiment_id}"))
 }
 
+/// Remove per-process Frama-C temp directories whose server is gone.
+///
+/// frama_c_tmp_dir names each one after the server that made it, and Drop
+/// removes it on a clean exit. A server killed with SIGKILL runs no Drop, so
+/// the directory outlives it with no owner: measured, a kill -9 left two
+/// behind and eight older ones had already accumulated under the private root.
+///
+/// Liveness rather than age, because age cannot tell a long proof from an
+/// orphan and this server can legitimately hold one open for hours. A pid that
+/// has been reused answers alive and the directory is kept, which is the safe
+/// direction: this only ever declines to delete.
+pub(crate) fn sweep_orphaned_frama_c_tmp_dirs() {
+    // Do not follow a pre-created /tmp/fcmcp-<uid> symlink merely to inspect
+    // it: the sweep removes children. The same validation every writer uses
+    // must happen before read_dir.
+    let Ok(root) = ensure_private_root() else {
+        return;
+    };
+    sweep_orphaned_frama_c_tmp_dirs_in(&root);
+}
+
+/// The sweep itself, against a named root so a test can own one.
+pub fn sweep_orphaned_frama_c_tmp_dirs_in(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let own = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("tmp-") else {
+            continue;
+        };
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == own || crate::mcp::proc::process_is_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Refuse a sandbox whose socket path would not fit in a Unix socket address.
+///
+/// sun_path is 108 bytes on Linux including the terminator, and the sandbox's
+/// socket is "frama-c.sock" inside a directory that carries the caller's
+/// experiment_id. is_safe_path_segment accepts an id of 128, which is longer
+/// than the remaining budget, so the two limits disagree and the socket one
+/// wins at connect time with an error naming neither the id nor the cap.
+///
+/// Measured rather than assumed: the path is built and counted here, so a
+/// change to the private root or to the sandbox directory scheme moves this
+/// check with it instead of leaving a stale constant behind.
+pub fn sandbox_socket_path_error(sandbox_dir: &Path) -> Result<(), McpError> {
+    // The terminator is the byte the cap includes and the string does not.
+    #[cfg(target_os = "macos")]
+    const SUN_PATH_MAX: usize = 104;
+    #[cfg(not(target_os = "macos"))]
+    const SUN_PATH_MAX: usize = 108;
+    let socket = sandbox_dir.join("frama-c.sock");
+    let len = socket.as_os_str().as_encoded_bytes().len();
+    if len + 1 > SUN_PATH_MAX {
+        return Err(McpError::invalid_params(
+            format!(
+                "experiment_id is too long for this sandbox's socket path: it would be {len} \
+                 bytes against a {SUN_PATH_MAX} byte limit. Use a shorter experiment_id, by \
+                 about {} characters.",
+                len + 1 - SUN_PATH_MAX
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// The directory this server keeps its scratch state in, named but not created.
 ///
 /// Under /tmp rather than the state directory, and short, because a Unix socket
