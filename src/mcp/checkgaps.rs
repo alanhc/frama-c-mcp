@@ -291,7 +291,9 @@ fn unrequested_analysis_gaps(
         // is sound. Read off the run rather than off the load flag, because the
         // run is what decided it.
         let wp_covered_runtime_errors = wanted.wp
-            && wp.pointer("/effective_wp_config/rte").and_then(serde_json::Value::as_bool)
+            && wp
+                .pointer("/effective_wp_config/rte")
+                .and_then(serde_json::Value::as_bool)
                 == Some(true);
         incomplete.push(json!({
             "code": incomplete_code::RTE_DISABLED,
@@ -434,7 +436,11 @@ fn parsed_hypothesis_entries(probe: &serde_json::Value) -> Vec<serde_json::Value
 fn unparsed_hypothesis_warnings(probe: &serde_json::Value) -> u64 {
     hypothesis_entries(probe)
         .iter()
-        .filter_map(|entry| entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64))
+        .filter_map(|entry| {
+            entry
+                .get("unparsed_warning_count")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum()
 }
 
@@ -1039,7 +1045,9 @@ pub(crate) type DigestGroups = std::collections::HashMap<String, Vec<(String, As
 /// than path, so one YAML under two paths is still one machine.
 pub fn machdep_digest(machdep: Option<&str>) -> Option<String> {
     let file = std::fs::File::open(machdep?).ok()?;
-    crate::state::sha256_hex_of_reader(file).ok().map(|(digest, _)| digest)
+    crate::state::sha256_hex_of_reader(file)
+        .ok()
+        .map(|(digest, _)| digest)
 }
 
 /// What two variants must share to have analysed the same program: the printed

@@ -14,10 +14,10 @@
 //! run_wp_memory_model_probe.
 
 use super::*;
-use crate::mcp::server::receipt::ISOLATED_RETRY_NO_AST;
 use crate::mcp::server::checkgaps::{
-    probe_absent, PROBE_READ_FROM_RETRY_OUTPUT, PROBE_READ_FROM_SEPARATE_RUN,
+    PROBE_READ_FROM_RETRY_OUTPUT, PROBE_READ_FROM_SEPARATE_RUN, probe_absent,
 };
+use crate::mcp::server::receipt::ISOLATED_RETRY_NO_AST;
 
 /// One isolated CLI retry: which files to load, what to prove in them, and
 /// under which provers.
@@ -291,28 +291,31 @@ impl FramaCMcpServer {
             },
         });
         let receipt = self
-            .proof_receipt(None, ProofReceiptRequest {
-                tool: "run_wp",
-                source_files: files,
-                wp_config: response["effective_wp_config"].clone(),
-                eva_config: eva_config_absent("tool_does_not_run_eva"),
-                goals: &[],
-                stable_scope: None,
-                goals_status_source: ISOLATED_RETRY_NO_AST,
-                reported: json!({
-                    "failure_kind": response["failure_kind"].clone(),
-                    "wp_timeout_triage": response["wp_timeout_triage"].clone(),
-                    "wp_attempts": response["wp_attempts"].clone(),
-                }),
-                // No goals in an isolated CLI retry payload.
-                properties: &HashMap::new(),
+            .proof_receipt(
+                None,
+                ProofReceiptRequest {
+                    tool: "run_wp",
+                    source_files: files,
+                    wp_config: response["effective_wp_config"].clone(),
+                    eva_config: eva_config_absent("tool_does_not_run_eva"),
+                    goals: &[],
+                    stable_scope: None,
+                    goals_status_source: ISOLATED_RETRY_NO_AST,
+                    reported: json!({
+                        "failure_kind": response["failure_kind"].clone(),
+                        "wp_timeout_triage": response["wp_timeout_triage"].clone(),
+                        "wp_attempts": response["wp_attempts"].clone(),
+                    }),
+                    // No goals in an isolated CLI retry payload.
+                    properties: &HashMap::new(),
 
-                // The isolated retry proves the files on disk in its own
-                // processes and never asks this server's Frama-C for anything,
-                // so there is no print in hand to share.
-                ast_source: None,
-                ast_digest: None,
-            })
+                    // The isolated retry proves the files on disk in its own
+                    // processes and never asks this server's Frama-C for
+                    // anything, so there is no print in hand to share.
+                    ast_source: None,
+                    ast_digest: None,
+                },
+            )
             .await;
         response["proof_receipt"] = receipt;
         Ok(json_result(response))
@@ -456,8 +459,7 @@ pub async fn run_wp_memory_model_probe(
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let hypotheses =
-                crate::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&text);
+            let hypotheses = crate::mcp::server::wpclass::wp_memory_model_hypotheses_in_text(&text);
             let command: Vec<String> = std::iter::once(frama_c_path.to_string())
                 .chain(args)
                 .collect();
@@ -560,9 +562,10 @@ pub async fn run_why3_dump(
     // The one thing this gives up is a file over the size cap, which reports
     // "truncated": true with no content and was previously still on disk
     // because nothing cleaned it up. That was a leak rather than a promise.
-    let Ok(out_dir_guard) =
-        private_temp_dir(&format!("frama-c-why3-dump-{}-", function.replace(':', "-")))
-    else {
+    let Ok(out_dir_guard) = private_temp_dir(&format!(
+        "frama-c-why3-dump-{}-",
+        function.replace(':', "-")
+    )) else {
         return json!({
             "status": "error",
             "reason": "could not create a temporary directory for the why3 dump",

@@ -11,28 +11,37 @@ pub fn classify_wp_goal(goal: &serde_json::Value) -> (String, Option<String>) {
         regex::Regex::new(r"\b((?:re|en|as|li|la|lv|at|an)_[0-9a-f]{8})(?:\b|_)").unwrap()
     });
 
-    let name = goal.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = goal
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let name_lc = name.to_ascii_lowercase();
 
     // RTE class (obligation automatically inserted by WP; the name contains
     // feature keywords)
-    if name_lc.contains("signed_overflow") || name_lc.contains("unsigned_overflow")
-        || name_lc.contains("integer_overflow") || name_lc.contains("downcast")
+    if name_lc.contains("signed_overflow")
+        || name_lc.contains("unsigned_overflow")
+        || name_lc.contains("integer_overflow")
+        || name_lc.contains("downcast")
     {
         return ("rte_overflow".into(), None);
     }
-    if name_lc.contains("index_in_bound") || name_lc.contains("index_bound")
+    if name_lc.contains("index_in_bound")
+        || name_lc.contains("index_bound")
         || name_lc.contains("array_bound")
     {
         return ("rte_bound".into(), None);
     }
-    if name_lc.contains("division_by_zero") || name_lc.contains("div_by_zero")
+    if name_lc.contains("division_by_zero")
+        || name_lc.contains("div_by_zero")
         || name_lc.contains("modulo")
     {
         return ("rte_division".into(), None);
     }
-    if name_lc.contains("mem_access") || name_lc.contains("initialization")
-        || name_lc.contains("dangling") || name_lc.contains("pointer_validity")
+    if name_lc.contains("mem_access")
+        || name_lc.contains("initialization")
+        || name_lc.contains("dangling")
+        || name_lc.contains("pointer_validity")
     {
         return ("rte_pointer".into(), None);
     }
@@ -134,9 +143,15 @@ fn classify_failure_reason(
             "Run self_check and inspect Frama-C request compatibility before changing annotations.",
         )
     } else if normalized_status == "failed"
-        || ["internal", "exception", "rejected", "server error", "plugin error"]
-            .iter()
-            .any(|needle| text.contains(needle))
+        || [
+            "internal",
+            "exception",
+            "rejected",
+            "server error",
+            "plugin error",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
     {
         // Where a Why3 abort lands, and the reason there is no branch above
         // matching the abort text: the goal record does not carry it. WP words
@@ -168,9 +183,14 @@ fn classify_failure_reason(
              which no goal carries, and it is the fallback for the goals whose property row \
              supplied no predicate to copy.",
         )
-    } else if ["unsupported", "unbound", "unknown predicate", "unknown logic"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    } else if [
+        "unsupported",
+        "unbound",
+        "unknown predicate",
+        "unknown logic",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
     {
         push_evidence("goal_text", json!(name));
         (
@@ -303,10 +323,8 @@ pub fn classify_wp_failure_from_goal(
     goal: &serde_json::Value,
     function: Option<&str>,
 ) -> serde_json::Value {
-    let normalized_status = crate::mcp::status::consolidated_status(goal)
-        .unwrap_or("unknown");
-    let raw_status = crate::mcp::status::raw_status(goal)
-        .unwrap_or(normalized_status);
+    let normalized_status = crate::mcp::status::consolidated_status(goal).unwrap_or("unknown");
+    let raw_status = crate::mcp::status::raw_status(goal).unwrap_or(normalized_status);
     let inferred_goal_kind;
     let goal_kind = if let Some(kind) = goal.get("goal_kind").and_then(|value| value.as_str()) {
         kind
@@ -315,7 +333,10 @@ pub fn classify_wp_failure_from_goal(
         inferred_goal_kind = kind;
         inferred_goal_kind.as_str()
     };
-    let name = goal.get("name").and_then(|value| value.as_str()).unwrap_or("");
+    let name = goal
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let property = goal
         .get("property")
         .or_else(|| goal.get("property_marker"))
@@ -581,7 +602,10 @@ pub fn proofread_drop_stale_retry_advice(
                  of. Read the VC, or supply the contract the obligation needs."
             ),
         );
-        if let Some(evidence) = object.get_mut("evidence").and_then(|value| value.as_array_mut()) {
+        if let Some(evidence) = object
+            .get_mut("evidence")
+            .and_then(|value| value.as_array_mut())
+        {
             evidence.push(json!({
                 "field": "timeout_retry",
                 "value": "retried at double the timeout, still unproved",
@@ -620,8 +644,14 @@ pub fn proofread_report_with_basis(
     basis: &str,
 ) -> serde_json::Value {
     findings.sort_by(|a, b| {
-        let a_severity = a.get("severity").and_then(|value| value.as_str()).unwrap_or("info");
-        let b_severity = b.get("severity").and_then(|value| value.as_str()).unwrap_or("info");
+        let a_severity = a
+            .get("severity")
+            .and_then(|value| value.as_str())
+            .unwrap_or("info");
+        let b_severity = b
+            .get("severity")
+            .and_then(|value| value.as_str())
+            .unwrap_or("info");
         proofread_severity_rank(b_severity)
             .cmp(&proofread_severity_rank(a_severity))
             .then_with(|| {
@@ -661,10 +691,12 @@ pub fn proofread_report_with_basis(
     // "unknown" and an absent line sorts last. A finding with no id is left
     // alone rather than collapsed with every other id-less row.
     let mut seen_ids = std::collections::HashSet::new();
-    findings.retain(|finding| match finding.get("id").and_then(|value| value.as_str()) {
-        Some(id) => seen_ids.insert(id.to_string()),
-        None => true,
-    });
+    findings.retain(
+        |finding| match finding.get("id").and_then(|value| value.as_str()) {
+            Some(id) => seen_ids.insert(id.to_string()),
+            None => true,
+        },
+    );
 
     let top = findings.first();
     let markdown = findings
@@ -881,11 +913,15 @@ fn proofread_why_problem(category: &str, goal_kind: &str) -> &'static str {
         "internal_error" => "Frama-C or WP reported an internal failure for this obligation.",
         "unsupported_predicate" => "The proof uses logic that WP could not handle.",
         "callee_requires_too_strict" => "The caller has not established the callee precondition.",
-        "callee_contract_too_weak" => "The callee contract does not expose enough postcondition information.",
+        "callee_contract_too_weak" => {
+            "The callee contract does not expose enough postcondition information."
+        }
         "incomplete_behavior_partition" => "WP reported an open behavior partition obligation.",
         "weak_loop_assigns" => "The loop frame does not cover the writes WP must reason about.",
         "weak_loop_variant" => "The loop termination variant is still unproved.",
-        "weak_loop_invariant" => "The loop invariant does not establish or preserve the needed property.",
+        "weak_loop_invariant" => {
+            "The loop invariant does not establish or preserve the needed property."
+        }
         "bad_assigns" => "The assigns frame does not match the writes WP observes.",
         "weak_ensures" => "The postcondition is still unproved for this function.",
         "missing_requires" => "The precondition is too weak for this proof obligation.",
@@ -991,9 +1027,7 @@ fn stable_goal_part_key(goal: &serde_json::Value) -> String {
     // The digit check keeps a function named `parse_partition` from donating a
     // tail that WP never generated.
     match wpo.rsplit_once("_part") {
-        Some((_, digits))
-            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
-        {
+        Some((_, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
             format!("_part{digits}")
         }
         _ => String::new(),
@@ -1385,8 +1419,7 @@ pub fn wp_timeout_triage_none() -> serde_json::Value {
 /// prover_timeout_triage withdrew confidence for a replayed run while
 /// wp_timeout_triage_from_goal answered "high, a higher prover timeout may
 /// help" about the same goal.
-pub const REPLAYED_GOAL_REASON: &str =
-    "This goal's verdict came back from WP's cache rather than being attempted on this run, so \
+pub const REPLAYED_GOAL_REASON: &str = "This goal's verdict came back from WP's cache rather than being attempted on this run, so \
      nothing here measured it. WP's cache defaults to Update and stores timeout verdicts too. \
      Re-run with cache: \"None\" before treating it as a property of the goal.";
 
@@ -1398,8 +1431,7 @@ pub const REPLAYED_GOAL_REASON: &str =
 /// scopes really do differ: one goal's verdict was replayed, or every timed-out
 /// goal in the run was. Composing one from the other would save a sentence and
 /// cost the reader the difference.
-pub const REPLAYED_RUN_REASON: &str =
-    "Every timed-out goal in this run came back from WP's cache rather than being attempted, so \
+pub const REPLAYED_RUN_REASON: &str = "Every timed-out goal in this run came back from WP's cache rather than being attempted, so \
      this run measured nothing about them. WP's cache defaults to Update and stores timeout \
      verdicts too. Re-run with cache: \"None\" before drawing any conclusion.";
 
@@ -1419,10 +1451,8 @@ fn replayed_goal_triage(kind: &str) -> serde_json::Value {
 }
 
 pub fn wp_timeout_triage_from_goal(goal: &serde_json::Value) -> serde_json::Value {
-    let normalized_status = crate::mcp::status::consolidated_status(goal)
-        .unwrap_or("unknown");
-    let raw_status = crate::mcp::status::raw_status(goal)
-        .unwrap_or(normalized_status);
+    let normalized_status = crate::mcp::status::consolidated_status(goal).unwrap_or("unknown");
+    let raw_status = crate::mcp::status::raw_status(goal).unwrap_or(normalized_status);
     if crate::mcp::status::status_is_timeout(normalized_status)
         || crate::mcp::status::status_is_timeout(raw_status)
     {
@@ -1503,9 +1533,7 @@ pub fn wp_timeout_triage_from_tasks_and_report(
         .map(|findings| {
             findings
                 .iter()
-                .filter(|f| {
-                    f.get("category").and_then(|c| c.as_str()) == Some("timeout")
-                })
+                .filter(|f| f.get("category").and_then(|c| c.as_str()) == Some("timeout"))
                 .collect()
         })
         .unwrap_or_default();
@@ -1809,7 +1837,10 @@ pub fn wp_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_j
 /// so the owned form allocated and freed twice per comparison for an ordering
 /// that never needed one.
 fn hypothesis_function_name(entry: &serde_json::Value) -> &str {
-    entry.get("function").and_then(|value| value.as_str()).unwrap_or_default()
+    entry
+        .get("function")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
 }
 
 /// Two readings of the same program's hypotheses, merged.
@@ -1847,7 +1878,9 @@ pub fn merge_memory_model_hypotheses(
         entries
             .iter()
             .filter_map(|entry| {
-                entry.get("unparsed_warning_count").and_then(serde_json::Value::as_u64)
+                entry
+                    .get("unparsed_warning_count")
+                    .and_then(serde_json::Value::as_u64)
             })
             .sum()
     };
@@ -1856,11 +1889,17 @@ pub fn merge_memory_model_hypotheses(
         |entry: &serde_json::Value| entry.get("function").is_some_and(|name| !name.is_null());
 
     let clauses = |entry: &serde_json::Value| -> u64 {
-        entry.get("hypothesis_count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+        entry
+            .get("hypothesis_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
     };
     let mut merged: Vec<serde_json::Value> = into.into_iter().filter(named).collect();
     for entry in from.into_iter().filter(named) {
-        match merged.iter_mut().find(|kept| kept.get("function") == entry.get("function")) {
+        match merged
+            .iter_mut()
+            .find(|kept| kept.get("function") == entry.get("function"))
+        {
             Some(kept) if clauses(&entry) > clauses(kept) => *kept = entry,
             Some(_) => {}
             None => merged.push(entry),
@@ -1930,7 +1969,11 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         if !by_category && blocks.is_empty() {
             continue;
         }
-        let matched_by = if by_category { "log_category" } else { "message_text" };
+        let matched_by = if by_category {
+            "log_category"
+        } else {
+            "message_text"
+        };
 
         // A record matched on category alone whose wording this cannot parse is
         // counted rather than dropped, because dropping it would be the silence
@@ -1939,7 +1982,10 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         if blocks.is_empty() {
             unparsed += 1;
             if unparsed == 1 {
-                unparsed_source = message.get("source").cloned().unwrap_or_else(|| json!(null));
+                unparsed_source = message
+                    .get("source")
+                    .cloned()
+                    .unwrap_or_else(|| json!(null));
                 unparsed_matched_by = matched_by;
             }
             continue;
@@ -1967,9 +2013,8 @@ fn collect_memory_model_hypotheses(messages: &[serde_json::Value]) -> Vec<serde_
         }
     }
 
-    found.sort_by(|left, right| {
-        hypothesis_function_name(left).cmp(hypothesis_function_name(right))
-    });
+    found
+        .sort_by(|left, right| hypothesis_function_name(left).cmp(hypothesis_function_name(right)));
 
     if unparsed > 0 {
         found.push(json!({
@@ -2104,7 +2149,10 @@ fn hypothesis_clauses(block: &str) -> (Vec<String>, usize) {
     (clauses, total)
 }
 
-pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json::Value) -> &'static str {
+pub fn wp_failure_kind_from_tasks(
+    tasks: &serde_json::Value,
+    triage: &serde_json::Value,
+) -> &'static str {
     let triage_kind = triage
         .get("kind")
         .and_then(|value| value.as_str())
@@ -2164,9 +2212,7 @@ fn wp_tasks_contain_goal_with_status(
             let has_goal_id = object.contains_key("stable_goal_id")
                 || object.contains_key("goal_kind")
                 || object.contains_key("property_marker");
-            if has_goal_id
-                && crate::mcp::status::consolidated_status(value).is_some_and(accept)
-            {
+            if has_goal_id && crate::mcp::status::consolidated_status(value).is_some_and(accept) {
                 return true;
             }
             object

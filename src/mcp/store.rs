@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::state::VerificationStatus;
 
 use crate::state::{
-    sha256_hex, FunctionVerificationState, ProjectVerificationState, SandboxMetadata,
+    FunctionVerificationState, ProjectVerificationState, SandboxMetadata, sha256_hex,
 };
 
 /// Long-text conclusion fields, paired with what a missing .md file reads back
@@ -215,7 +215,8 @@ pub fn persist_conclusion_at(
     let mut value = serde_json::to_value(conclusion)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(obj) = value.as_object_mut() {
-        let existing_files: Vec<String> = LONG_TEXT_FIELDS.iter()
+        let existing_files: Vec<String> = LONG_TEXT_FIELDS
+            .iter()
             .map(|(field, _)| format!("{}.md", field))
             .filter(|fname| dir.join(fname).is_file())
             .collect();
@@ -606,7 +607,9 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         let func = match path.file_name().and_then(|s| s.to_str()) {
             Some(s) if is_safe_path_segment(s) => s.to_string(),
             _ => continue,
