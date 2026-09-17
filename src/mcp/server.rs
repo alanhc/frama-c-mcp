@@ -22,7 +22,7 @@ use crate::frama_c::{codec, transport::Transport};
 // server's namespace with "use super::*", so one import here is what keeps the
 // shared vocabulary reachable from all of them.
 pub use crate::mcp::acsl::*;
-pub use crate::mcp::budgets::*;
+pub(crate) use crate::mcp::budgets::*;
 pub use crate::mcp::proc::*;
 pub use crate::mcp::status::*;
 pub use crate::mcp::store::*;

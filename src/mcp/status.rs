@@ -73,7 +73,7 @@ pub fn raw_status(row: &Value) -> Option<&str> {
 /// The normalized verdict, derived from the raw spelling when the row does not
 /// already carry one. A row with no status at all normalizes to "unknown",
 /// which is what normalize_frama_c_status answers for an empty string.
-pub fn normalized_or_derived(row: &Value) -> String {
+pub(crate) fn normalized_or_derived(row: &Value) -> String {
     row.get("normalized_status")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -83,7 +83,7 @@ pub fn normalized_or_derived(row: &Value) -> String {
 /// Frama-C's spellings folded onto the names the rest of the server compares
 /// against. Anything not named here passes through, so a verdict Frama-C starts
 /// emitting arrives intact rather than as a silent "unknown".
-pub fn normalize_frama_c_status(raw: &str) -> String {
+pub(crate) fn normalize_frama_c_status(raw: &str) -> String {
     let normalized = raw
         .chars()
         .map(|c| {
@@ -129,7 +129,7 @@ pub fn normalize_frama_c_status(raw: &str) -> String {
 /// wp_tasks_contain_failed_goal,
 /// which asks what the property it hangs off consolidated to. Which status to
 /// read is the call site's decision; the comparison itself lives here.
-pub fn status_is_failed(status: &str) -> bool {
+pub(crate) fn status_is_failed(status: &str) -> bool {
     status.eq_ignore_ascii_case("failed")
 }
 
@@ -142,13 +142,13 @@ pub fn status_is_failed(status: &str) -> bool {
 /// and the proofread report categorizes them, which is four answers available
 /// to one question. Which status to read stays the call site's decision; the
 /// comparison itself lives here.
-pub fn status_is_timeout(status: &str) -> bool {
+pub(crate) fn status_is_timeout(status: &str) -> bool {
     status.eq_ignore_ascii_case("timeout")
 }
 
 /// The derived flags every status-bearing payload carries next to its
 /// normalized status.
-pub fn insert_status_flags(
+pub(crate) fn insert_status_flags(
     obj: &mut serde_json::Map<String, Value>,
     normalized: &str,
 ) {
@@ -202,18 +202,18 @@ pub fn add_status_fields(value: &mut Value) {
 /// valid_but_dead separates them: false here and in the enriched form, true at
 /// the receipt row. Pick by the shape in hand, and do not assume a receipt row
 /// can be routed through either of the other two.
-pub fn status_counts_as_progress(normalized: &str) -> bool {
+pub(crate) fn status_counts_as_progress(normalized: &str) -> bool {
     normalized == "valid"
 }
 
-pub fn status_requires_hypotheses(normalized: &str) -> bool {
+pub(crate) fn status_requires_hypotheses(normalized: &str) -> bool {
     matches!(
         normalized,
         "valid_under_hyp" | "invalid_under_hyp" | "valid_under_false_hypothesis"
     )
 }
 
-pub fn status_is_vacuous(normalized: &str) -> bool {
+pub(crate) fn status_is_vacuous(normalized: &str) -> bool {
     normalized.ends_with("_but_dead") || normalized == "valid_under_false_hypothesis"
 }
 
@@ -240,6 +240,6 @@ pub fn own_status_is_proved(row: &Value) -> bool {
 /// run_measurement asked the property's verdict for a question about the goal,
 /// beside a line asking the goal's own verdict for whether it was proved, so
 /// one loop asked two different questions about the same row.
-pub fn own_status_is_timeout(row: &Value) -> bool {
+pub(crate) fn own_status_is_timeout(row: &Value) -> bool {
     own_status(row).is_some_and(status_is_timeout)
 }

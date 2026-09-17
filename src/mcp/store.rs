@@ -39,7 +39,7 @@ const LONG_TEXT_FIELDS: &[(&str, Option<&str>)] = &[
 /// experiment_id, so an entry an aborted run left behind makes the next
 /// create_sandbox reject the same id. Callers that need a clean slate per run,
 /// the test suite above all, point the variable at a directory of their own.
-pub fn conclusion_base_dir() -> PathBuf {
+pub(crate) fn conclusion_base_dir() -> PathBuf {
     std::env::var_os("FRAMA_C_MCP_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".frama-c-mcp"))
@@ -63,7 +63,7 @@ pub fn is_safe_path_segment(value: &str) -> bool {
 }
 
 /// Tool-boundary form of [`is_safe_path_segment`], with a caller-facing error.
-pub fn require_safe_path_segment(value: &str, field: &str) -> Result<(), McpError> {
+pub(crate) fn require_safe_path_segment(value: &str, field: &str) -> Result<(), McpError> {
     if is_safe_path_segment(value) {
         return Ok(());
     }
@@ -168,7 +168,7 @@ pub fn resolve_output_path_in(root: &Path, path: &str) -> Result<PathBuf, McpErr
     Ok(normalized)
 }
 
-pub fn conclusion_dir(func: &str) -> PathBuf {
+pub(crate) fn conclusion_dir(func: &str) -> PathBuf {
     conclusion_base_dir().join(func)
 }
 
@@ -234,21 +234,26 @@ pub fn persist_conclusion_at(
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
 /// meta.json.
-pub fn persist_conclusion(func: &str, conclusion: &FunctionVerificationState) -> std::io::Result<()> {
+pub(crate) fn persist_conclusion(
+    func: &str,
+    conclusion: &FunctionVerificationState,
+) -> std::io::Result<()> {
     persist_conclusion_at(&conclusion_base_dir(), func, conclusion)
 }
 
 /// Write `ProjectVerificationState` to `<base_dir>/_program.json` atomically.
 /// Takes `base_dir` so tests can point at a tempdir; production calls
 /// `persist_program_state`.
-pub fn persist_program_state_at(base_dir: &Path, state: &ProjectVerificationState)
-    -> std::io::Result<()> {
+pub(crate) fn persist_program_state_at(
+    base_dir: &Path,
+    state: &ProjectVerificationState,
+) -> std::io::Result<()> {
     write_json_atomic(&base_dir.join("_program.json"), state)
 }
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
 /// `_program.json`.
-pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
+pub(crate) fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
     persist_program_state_at(&conclusion_base_dir(), state)
 }
 
@@ -292,7 +297,7 @@ const WRITER_TMP_STALE: std::time::Duration = std::time::Duration::from_secs(360
 ///
 /// Failures are ignored throughout. This is tidying, and a state directory that
 /// cannot be read or swept is a problem the caller will hit on its own terms.
-pub fn sweep_writer_temp_files(base_dir: &Path) {
+pub(crate) fn sweep_writer_temp_files(base_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir_or_cwd(base_dir)) else {
         return;
     };
@@ -378,7 +383,7 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> std::io::Res
     Ok(())
 }
 
-pub fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
+pub(crate) fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
     base_dir.join("sandboxes.json")
 }
 
@@ -452,7 +457,7 @@ pub fn private_root_path() -> PathBuf {
 /// or a genuinely confusing machine, and quietly chmod-ing somebody else's
 /// directory is not this program's business. lstat, not stat, so a symlink at
 /// the root is seen rather than followed.
-pub fn ensure_private_root() -> std::io::Result<PathBuf> {
+pub(crate) fn ensure_private_root() -> std::io::Result<PathBuf> {
     let root = private_root_path();
     ensure_private_dir(&root)?;
     Ok(root)
@@ -516,7 +521,7 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-pub fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
+pub(crate) fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
     let sandbox_dir = expected_sandbox_dir(base_dir, &sandbox.experiment_id);
     sandbox.sandbox_dir == sandbox_dir && sandbox.sandbox_socket == sandbox_dir.join("frama-c.sock")
 }
@@ -538,7 +543,7 @@ pub fn load_sandbox_metadata_from_disk(base_dir: &Path) -> Vec<SandboxMetadata> 
         .collect()
 }
 
-pub fn persist_sandbox_metadata_at(
+pub(crate) fn persist_sandbox_metadata_at(
     base_dir: &Path,
     sandboxes: &[SandboxMetadata],
 ) -> std::io::Result<()> {
@@ -567,7 +572,7 @@ pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<
     remember_sandbox_metadata_at(&conclusion_base_dir(), metadata)
 }
 
-pub fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
+pub(crate) fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
     let base_dir = conclusion_base_dir();
     let _guard = lock_state_dir(&base_dir)?;
     let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
