@@ -214,9 +214,23 @@ impl McpHandle {
         handle
     }
 
+    /// The test binary with PATH replaced, so a test decides which helper
+    /// tools the server finds.
+    pub fn spawn_test_binary_with_frama_c_and_path(frama_c: &str, path: &std::ffi::OsStr) -> Self {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp"));
+        let mut cmd = server_command(&binary, frama_c, None);
+        cmd.env("PATH", path);
+        let mut handle = Self::from_command(cmd);
+        handle.initialize();
+        handle
+    }
+
     /// The process, started but not yet hand-shaken.
     fn spawn_uninitialized(binary: PathBuf, frama_c: &str, cwd: Option<&Path>) -> Self {
-        let mut cmd = server_command(&binary, frama_c, cwd);
+        Self::from_command(server_command(&binary, frama_c, cwd))
+    }
+
+    fn from_command(mut cmd: StdCommand) -> Self {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

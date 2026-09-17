@@ -500,6 +500,13 @@ answered `invalid`.
 derived from the same probe, so it cannot go stale against the version actually
 installed.
 
+When the configured `frama-c` cannot be run at all, `frama_c_candidates` lists
+the opam switches whose `bin` holds one, with a `hint` naming the first: start
+the server with that `--frama-c`, or activate that switch, and install
+ast-utils into the same switch. `opam_switch_hint` beside it only names the
+current switch, which is the one that just failed. The field is null when
+`frama-c` runs.
+
 `self_check` also accepts `canary: true`. The request probes report which
 requests answer; they cannot report whether EVA and WP still catch anything, and
 an install where every request answers and no alarm is ever raised passes them

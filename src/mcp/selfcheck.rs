@@ -719,6 +719,84 @@ pub fn with_version_verdict(mut probe: serde_json::Value) -> serde_json::Value {
     probe
 }
 
+async fn opam_switch_frama_c(ordinal: usize, switch: String) -> Option<(usize, serde_json::Value)> {
+    let switch_arg = format!("--switch={switch}");
+    let bin = run_command_json("opam", &["var", &switch_arg, "bin"], TOOL_PROBE_BUDGET).await;
+    let bin = bin["stdout"].as_str().filter(|bin| !bin.is_empty())?;
+    let candidate = std::path::Path::new(bin).join("frama-c");
+    let executable = std::fs::metadata(&candidate).is_ok_and(|meta| {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    });
+    executable.then(|| {
+        (
+            ordinal,
+            json!({"switch": switch, "frama_c": candidate.display().to_string()}),
+        )
+    })
+}
+
+/// The opam switches whose bin directory holds an executable frama-c.
+///
+/// Asked only when the configured Frama-C is missing. The opam_switch_hint
+/// beside it names the current switch, which is exactly the one that failed
+/// when frama-c is not on PATH, so on its own it pointed the reader back at the
+/// problem. This is the resolution acsl-skills' env.sh uses: every switch, and
+/// the first whose bin has the binary. An empty list when opam is absent or
+/// answers nothing, never an error: a machine without opam is a normal one.
+async fn opam_switches_with_frama_c() -> Vec<serde_json::Value> {
+    // This runs only on a broken Frama-C configuration, so it must remain a
+    // bounded diagnostic. In particular, do not spend TOOL_PROBE_BUDGET once
+    // for every switch: a machine with stale or hung switches used to turn one
+    // self_check into an unbounded sequence of five-second waits.
+    let deadline = tokio::time::Instant::now() + TOOL_PROBE_BUDGET;
+    let listed = run_command_json("opam", &["switch", "list", "--short"], TOOL_PROBE_BUDGET).await;
+    let mut switches = listed["stdout"]
+        .as_str()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .enumerate();
+    let mut probes = tokio::task::JoinSet::new();
+
+    // Parallel enough that one hung switch does not serialize discovery, capped
+    // so a corrupted opam listing cannot fan out unbounded child processes
+    // merely because self_check was requested.
+    for (ordinal, switch) in switches.by_ref().take(4) {
+        probes.spawn(opam_switch_frama_c(ordinal, switch));
+    }
+    let mut found = Vec::new();
+    loop {
+        tokio::select! {
+            // None once the set is empty, which is what ends the loop. The
+            // deadline arm is always live, so the loop must not wait on it for
+            // want of anything else to do: a guard that disabled this arm on an
+            // empty set left the sleep as the only way out, and every
+            // self_check with no frama-c took the whole budget.
+            probe = probes.join_next() => {
+                let Some(probe) = probe else { break };
+                if let Ok(Some(candidate)) = probe {
+                    found.push(candidate);
+                }
+                if let Some((ordinal, switch)) = switches.next() {
+                    probes.spawn(opam_switch_frama_c(ordinal, switch));
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                probes.abort_all();
+                break;
+            }
+        }
+    }
+
+    // The first candidate drives the repair hint, so keep opam's own order even
+    // though the probes themselves completed concurrently.
+    found.sort_by_key(|(ordinal, _)| *ordinal);
+    found.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
 impl FramaCMcpServer {
     pub async fn self_check_payload(&self) -> serde_json::Value {
         let frama_c_version = with_version_verdict(
@@ -726,6 +804,27 @@ impl FramaCMcpServer {
         );
         let opam_switch_hint =
             run_command_json("opam", &["var", "switch"], TOOL_PROBE_BUDGET).await;
+        let frama_c_candidates = if frama_c_version["status"] == "missing" {
+            let switches = opam_switches_with_frama_c().await;
+            let hint = match switches.first() {
+                Some(first) => format!(
+                    "frama-c was not found at {}. These opam switches have one; start the server \
+                     with --frama-c {} or run eval $(opam env --switch={}) first, and install \
+                     ast-utils into that same switch.",
+                    self.frama_c_path,
+                    first["frama_c"].as_str().unwrap_or_default(),
+                    first["switch"].as_str().unwrap_or_default()
+                ),
+                None => format!(
+                    "frama-c was not found at {}, and no opam switch lists one. Install Frama-C, or \
+                     pass --frama-c with its path.",
+                    self.frama_c_path
+                ),
+            };
+            json!({"opam_switches": switches, "hint": hint})
+        } else {
+            serde_json::Value::Null
+        };
         let why3_provers =
             run_command_json("why3", &["config", "list-provers"], TOOL_PROBE_BUDGET).await;
         let mut e_acsl_tools = Vec::new();
@@ -916,6 +1015,7 @@ impl FramaCMcpServer {
             },
             "frama_c": frama_c_version,
             "opam_switch_hint": opam_switch_hint,
+            "frama_c_candidates": frama_c_candidates,
             "ast_utils": {
                 "plugin": "ast_utils_plugin",
                 "status": spawn_status["ast_utils_plugin"].as_str().unwrap_or("not_loaded"),
