@@ -23,24 +23,23 @@ on:
 # lane now; that is cheaper than a documentation gate that cannot fail.
 
 # A push to a branch with a pull request open fires both triggers: one run on
-# the branch head, one on the merge ref, each paying a Frama-C install and a
-# fourteen minute suite. Keying on the head ref puts them in one group, so the
-# later run cancels the earlier.
+# the branch head and one on the merge ref. Keep those events in separate
+# groups: cancelling either run leaves cancelled checks attached to the same
+# commit, so GitHub reports the pull request as incomplete.
 #
 # The repository is in the key as well as the branch, because the branch name
 # alone is not unique across forks: two pull requests from two forks whose
 # branches are both called "dev" shared a group, and cancel-in-progress then
-# had one contributor's checks killed by the other's push. The fallbacks are
-# what keep the pair above in one group, since a push event carries neither
-# field and answers with this repository and the bare branch, which is exactly
-# what a pull request from this repository resolves to.
+# had one contributor's checks killed by the other's update. A push event
+# carries neither pull-request field, so the fallbacks use this repository and
+# the bare branch instead.
 #
 # Except on main, where a run may be holding the release window below open with
 # the previous release already deleted. Cancelling that leaves no release at
 # all, so pushes to main queue rather than replace each other.
 concurrency:
   group: >-
-    ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+    ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # The floor, raised per job by the two that need more: the release job takes
