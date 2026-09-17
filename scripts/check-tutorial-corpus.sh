@@ -3,8 +3,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wp-gate.sh
+source "$root/scripts/lib/wp-gate.sh"
 frama_c="${FRAMA_C_BIN:-frama-c}"
-version="$("$frama_c" -version | awk '{print $1}')"
+version="$(wp_gate_frama_c_version "$frama_c" "tutorial corpus")" || exit 1
 
 case "$version" in
     31.0 | 33.0) ;;
@@ -23,7 +25,6 @@ status=0
 # version the rows were measured under. An Alt-Ergo change then fails here
 # saying so, instead of silently shifting every baseline.
 expected_prover="Alt-Ergo 2.6.3"
-prover_seen=0
 
 # Measured 2026-08-10 on both switches with -wp-cache none, and identical on
 # both, which is why there is one table rather than one per Frama-C version. The
@@ -60,6 +61,13 @@ check_wp()
     local expected_proved expected_total timeout
     read -r expected_proved expected_total timeout < <(expected_baseline "$name")
 
+    # A 0 / 0 row is a table error, so it fails before any WP run is spent.
+    if [[ "$expected_proved" -eq "$expected_total" && "$expected_total" -eq 0 ]]; then
+        echo "FAIL $name: zero-goal fully-proved result is not a valid shape gate" >&2
+        status=1
+        return
+    fi
+
     local out
 
     # WP caches prover verdicts across runs, so without -wp-cache none a rerun
@@ -74,44 +82,18 @@ check_wp()
     # WP lists a prover only for the goals it actually ran, so a fixture Qed
     # discharged on its own prints no such row and cannot be required to name
     # one; the run-wide check below catches a run where no fixture named any.
-    local prover
-    prover="$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*(Alt-Ergo [0-9.]+):.*/\1/p' | tail -1 || true)"
-    if [[ -n "$prover" ]]; then
-        prover_seen=1
-        if [[ "$prover" != "$expected_prover" ]]; then
-            echo "FAIL $name: baselines were measured under $expected_prover, got $prover" >&2
-            echo "Re-measure every row before changing expected_prover." >&2
-            status=1
-            return
-        fi
-    fi
-
-    local line proved total
-    line="$(printf '%s\n' "$out" | grep -E 'Proved goals:[[:space:]]+[0-9]+[[:space:]]*/[[:space:]]*[0-9]+' | tail -1 || true)"
-    if [[ -z "$line" ]]; then
-        echo "FAIL $name: missing WP proved-goals summary" >&2
-        echo "$out" >&2
+    if ! wp_gate_check_prover "$name" "$out" "$expected_prover"; then
+        echo "Re-measure every row before changing expected_prover." >&2
         status=1
         return
     fi
 
-    proved="$(printf '%s\n' "$line" | sed -E 's/.*Proved goals:[[:space:]]*([0-9]+)[[:space:]]*\/[[:space:]]*([0-9]+).*/\1/')"
-    total="$(printf '%s\n' "$line" | sed -E 's/.*Proved goals:[[:space:]]*([0-9]+)[[:space:]]*\/[[:space:]]*([0-9]+).*/\2/')"
-
-    if [[ "$proved" != "$expected_proved" || "$total" != "$expected_total" ]]; then
-        echo "FAIL $name: expected $expected_proved / $expected_total, got $proved / $total" >&2
-        echo "$out" >&2
+    if ! wp_gate_expect_counts "$name" "$out" "$expected_proved / $expected_total"; then
         status=1
         return
     fi
 
-    if [[ "$expected_proved" -eq "$expected_total" && "$total" -eq 0 ]]; then
-        echo "FAIL $name: zero-goal fully-proved result is not a valid shape gate" >&2
-        status=1
-        return
-    fi
-
-    echo "ok $name: $proved / $total"
+    echo "ok $name: $expected_proved / $expected_total"
 }
 
 fixture="$root/tests/fixtures/tutorial"
@@ -133,9 +115,6 @@ check_wp "modular-group" \
 
 echo "skip eva-rotate.c: EVA fixture, not a WP baseline"
 
-if [[ "$prover_seen" -eq 0 ]]; then
-    echo "FAIL: no fixture reported a prover version, so nothing checked which one ran" >&2
-    status=1
-fi
+wp_gate_require_prover_seen "tutorial corpus" "$expected_prover" || status=1
 
 exit "$status"

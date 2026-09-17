@@ -3,8 +3,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wp-gate.sh
+source "$root/scripts/lib/wp-gate.sh"
 frama_c="${FRAMA_C_BIN:-frama-c}"
-version="$("$frama_c" -version | awk '{print $1}')"
+version="$(wp_gate_frama_c_version "$frama_c" "abs-int fixtures")" || exit 1
 
 case "$version" in
     31.0 | 33.0) ;;
@@ -17,6 +19,12 @@ esac
 
 status=0
 
+# No prover pin, unlike the other Frama-C gates, and not by omission. WP prints
+# a prover's version only in the summary row of a prover that discharged a goal.
+# abs-int-fixed.c closes every goal in Qed, and abs-int-buggy.c's one Alt-Ergo
+# goal times out, which WP reports as "(Alt-Ergo)" with no version. A pin here
+# would have nothing to compare and fail every run.
+
 check_wp()
 {
     local name="$1"
@@ -25,29 +33,18 @@ check_wp()
     local expected_total="$4"
     local require_goal="$5"
 
+    # -wp-cache none, as the other Frama-C gates pass. Without it WP runs in
+    # update mode, and the buggy fixture's 9 / 10 rests on an Alt-Ergo timeout
+    # the cache would replay rather than measure.
     local out
-    if ! out="$("$frama_c" -wp -wp-rte -wp-prover alt-ergo -wp-timeout 5 "$file" 2>&1)"; then
+    if ! out="$("$frama_c" -wp -wp-rte -wp-prover alt-ergo -wp-cache none -wp-timeout 5 "$file" 2>&1)"; then
         echo "FAIL $name: Frama-C command failed" >&2
         echo "$out" >&2
         status=1
         return
     fi
 
-    local line proved total
-    line="$(printf '%s\n' "$out" | grep -E 'Proved goals:[[:space:]]+[0-9]+[[:space:]]*/[[:space:]]*[0-9]+' | tail -1 || true)"
-    if [[ -z "$line" ]]; then
-        echo "FAIL $name: missing WP proved-goals summary" >&2
-        echo "$out" >&2
-        status=1
-        return
-    fi
-
-    proved="$(printf '%s\n' "$line" | sed -E 's/.*Proved goals:[[:space:]]*([0-9]+)[[:space:]]*\/[[:space:]]*([0-9]+).*/\1/')"
-    total="$(printf '%s\n' "$line" | sed -E 's/.*Proved goals:[[:space:]]*([0-9]+)[[:space:]]*\/[[:space:]]*([0-9]+).*/\2/')"
-
-    if [[ "$proved" != "$expected_proved" || "$total" != "$expected_total" ]]; then
-        echo "FAIL $name: expected $expected_proved / $expected_total, got $proved / $total" >&2
-        echo "$out" >&2
+    if ! wp_gate_expect_counts "$name" "$out" "$expected_proved / $expected_total"; then
         status=1
         return
     fi
@@ -68,7 +65,7 @@ check_wp()
         return
     fi
 
-    echo "ok $name: $proved / $total"
+    echo "ok $name: $expected_proved / $expected_total"
 }
 
 check_wp "abs-int-buggy.c" "$root/tests/fixtures/abs-int-buggy.c" 9 10 yes
@@ -84,17 +81,10 @@ check_mcp()
     local name="$1"
     local file="$2"
     local expectation="$3"
-    local binary="$root/target/release/frama-c-mcp"
+    wp_gate_mcp_ready "$name" || return 0
 
-    if [[ ! -x "$binary" ]]; then
-        echo "SKIP $name (MCP): $binary not built" >&2
-        return
-    fi
-
-    # stdout only. `check` prints JSON there, and folding stderr in would turn
-    # any future log line into a parse failure reported as a fixture regression.
     local out
-    if ! out="$("$binary" check "$file")"; then
+    if ! out="$(wp_gate_mcp_check "$frama_c" "$file")"; then
         echo "FAIL $name (MCP): check failed" >&2
         echo "$out" >&2
         status=1

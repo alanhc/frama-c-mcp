@@ -42,7 +42,11 @@ run()
     ran=$((ran + 1))
 
     local summary
-    summary=$(grep -E 'test result|^ok |PASS|^error' "$log" | tail -1)
+
+    # SKIP ranks with ok, and last wins, so a fixture gate whose MCP half was
+    # skipped for want of a release binary says so here rather than showing the
+    # "ok" of the Frama-C half that did run.
+    summary=$(grep -E 'test result|^ok |^SKIP |PASS|^error' "$log" | tail -1)
     printf '%-14s rc=%-4s %s\n' "$name" "$rc" "$summary"
 
     if [ "$rc" -ne 0 ]; then

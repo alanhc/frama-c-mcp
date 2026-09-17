@@ -9,8 +9,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wp-gate.sh
+source "$root/scripts/lib/wp-gate.sh"
 frama_c="${FRAMA_C_BIN:-frama-c}"
-version="$("$frama_c" -version | awk '{print $1}')"
+version="$(wp_gate_frama_c_version "$frama_c" "WP model fixtures")" || exit 1
 
 case "$version" in
     33.0) ;;
@@ -32,21 +34,6 @@ status=0
 # check-tutorial-corpus.sh pins its prover for exactly this reason; this script
 # took the style of assertion and, until now, left the guard behind.
 expected_prover="Alt-Ergo 2.6.3"
-prover_seen=0
-
-check_prover()
-{
-    local out="$1"
-    local name="$2"
-    local seen
-    seen="$(printf '%s\n' "$out" | grep -oE 'Alt-Ergo [0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-    [[ -z "$seen" ]] && return 0
-    prover_seen=1
-    if [[ "$seen" != "$expected_prover" ]]; then
-        echo "FAIL $name: prover is $seen, the counts here were measured under $expected_prover" >&2
-        status=1
-    fi
-}
 
 wp()
 {
@@ -87,17 +74,8 @@ else
 fi
 
 cast_out="$(wp 'Typed+cast' "$anomaly_fixture" || true)"
-check_prover "$cast_out" "pointer-cast-anomaly.c"
-proved_goals()
-{
-    printf '%s\n' "$1" \
-        | sed -nE 's/.*Proved goals:[[:space:]]*([0-9]+)[[:space:]]*\/[[:space:]]*([0-9]+).*/\1 \/ \2/p' \
-        | tail -1
-}
-cast_counts="$(proved_goals "$cast_out")"
-if [[ "$cast_counts" != "4 / 4" ]]; then
-    echo "FAIL pointer-cast-anomaly.c: Typed+cast expected 4 / 4, got ${cast_counts:-no summary line}" >&2
-    printf '%s\n' "$cast_out" >&2
+wp_gate_check_prover "pointer-cast-anomaly.c" "$cast_out" "$expected_prover" || status=1
+if ! wp_gate_expect_counts "pointer-cast-anomaly.c: Typed+cast" "$cast_out" "4 / 4"; then
     status=1
 else
     echo "ok pointer-cast-anomaly.c: Typed+cast proves 4 / 4"
@@ -109,11 +87,8 @@ fi
 # the budget, which is why the server must not answer it with "raise the
 # timeout".
 operator_out="$(wp 'Typed' "$root/tests/fixtures/uninterpreted-operator.c" || true)"
-check_prover "$operator_out" "uninterpreted-operator.c"
-operator_counts="$(proved_goals "$operator_out")"
-if [[ "$operator_counts" != "3 / 6" ]]; then
-    echo "FAIL uninterpreted-operator.c: expected 3 / 6, got ${operator_counts:-no summary line}" >&2
-    printf '%s\n' "$operator_out" >&2
+wp_gate_check_prover "uninterpreted-operator.c" "$operator_out" "$expected_prover" || status=1
+if ! wp_gate_expect_counts "uninterpreted-operator.c" "$operator_out" "3 / 6"; then
     status=1
 elif [[ "$(printf '%s\n' "$operator_out" | grep -c '\[Timeout\] typed_align_up_ensures')" != 3 ]]; then
     echo "FAIL uninterpreted-operator.c: expected three timed-out ensures goals" >&2
@@ -130,18 +105,10 @@ fi
 # was unreachable on every real run while three documents said otherwise.
 check_mcp_anomaly()
 {
-    local binary="$root/target/release/frama-c-mcp"
+    wp_gate_mcp_ready "pointer-cast-anomaly.c" || return 0
 
-    if [[ ! -x "$binary" ]]; then
-        echo "SKIP pointer-cast-anomaly.c (MCP): $binary not built" >&2
-        return
-    fi
-
-    # stdout only, as in check-abs-int-fixtures.sh: check prints JSON there and
-    # folding stderr in turns a future log line into a parse failure reported as
-    # a fixture regression.
     local out
-    if ! out="$("$binary" check "$anomaly_fixture")"; then
+    if ! out="$(wp_gate_mcp_check "$frama_c" "$anomaly_fixture")"; then
         echo "FAIL pointer-cast-anomaly.c (MCP): check failed" >&2
         echo "$out" >&2
         status=1
@@ -181,11 +148,6 @@ if call.get("tool") != "run_wp" or call.get("args", {}).get("model") != "Typed+c
 
 check_mcp_anomaly
 
-# A silent pin is not a pin. If no run reported a version, the guard above never
-# compared anything and the counts are unattributed.
-if [[ "$prover_seen" -eq 0 ]]; then
-    echo "FAIL: no run reported a prover version, so $expected_prover went unverified" >&2
-    status=1
-fi
+wp_gate_require_prover_seen "WP model fixtures" "$expected_prover" || status=1
 
 exit "$status"
