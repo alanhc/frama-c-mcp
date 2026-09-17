@@ -854,7 +854,7 @@ reload_project -> verify_program_step
 
 ## Testing
 
-Use the gate runner locally; it runs all thirteen repository checks, keeps logs
+Use the gate runner locally; it runs every repository check, keeps logs
 under `target/gate-logs`, and names failed tests. A unit test pins the runner
 against the CI workflows, so the two cannot drift apart.
 

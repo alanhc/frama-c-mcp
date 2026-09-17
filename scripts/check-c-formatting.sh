@@ -12,7 +12,7 @@
 # file under 20 and under 23 is two different files, so an unpinned gate either
 # passes on a tree nobody can reproduce or fails on a contributor's machine for
 # a reason the diff does not show. Refusing a version it was not measured under
-# is what the three Frama-C shell gates beside it already do.
+# is what the Frama-C shell gates beside it already do.
 #
 # The number is read from .ci/llvm-version rather than written here, so this
 # gate, the installer CI runs and the "make indent" a developer types cannot

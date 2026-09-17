@@ -277,6 +277,9 @@ jobs:
       - name: WP model and encoding fixture gate
         run: scripts/check-wp-model-fixtures.sh
 
+      - name: SV-COMP loop-invariant fixture gate
+        run: scripts/check-svcomp-fixture.sh
+
       - name: Integration tests (live Frama-C server)
         run: cargo test --test test-integration -- --test-threads=1
 
@@ -321,10 +324,12 @@ jobs:
           STDIO_LOG: ${{ runner.temp }}/mcp-stdio.log
         run: scripts/check-stdio-refusal.sh
 
-  # The supported floor, compiled but not measured. The three shell gates in
-  # the lane above pin proved-goal counts to Frama-C 33.0 and Alt-Ergo 2.6.3,
-  # so they cannot answer here, and widening their version cases to admit 32.1
-  # would compare this lane's proofs against numbers measured somewhere else.
+  # The supported floor, compiled but not measured. The Frama-C shell gates in
+  # the lane above pin proved-goal counts to the Frama-C versions they were
+  # measured under, 32.1 not among them, and, where WP's output names it, to
+  # Alt-Ergo 2.6.3, so they cannot answer here, and widening their version
+  # cases to admit 32.1 would compare this lane's proofs against numbers
+  # measured somewhere else.
   # What the floor actually claims is narrower: that the plug-in still compiles
   # against the oldest Frama-C the opam constraint allows, and that its own
   # OCaml regressions still pass there. That is what this lane checks, and
