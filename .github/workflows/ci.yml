@@ -193,6 +193,12 @@ jobs:
       - name: Validate Frama-C matrix version
         run: .ci/check-frama-c-matrix-version.sh '${{ matrix.frama-c-version }}'
 
+      # opam rewrites an older root's layout on first use, then exits 10 and
+      # asks for a retry. setup-ocaml takes the latest opam, so key on it.
+      - name: Record opam version
+        id: opam-version
+        run: echo "version=$(opam --version)" >> "$GITHUB_OUTPUT"
+
       # Cache the whole opam state keyed by frama-c + compiler + OS: frama-c is
       # not declared as a project dependency, so without this the ~10 min install
       # repeats every run. setup-ocaml uses a project-local switch in ./_opam
@@ -205,7 +211,7 @@ jobs:
           path: |
             ~/.opam
             _opam
-          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-${{ matrix.frama-c-version }}-alt-ergo-2.6.3-v2
+          key: ${{ runner.os }}-opam-${{ steps.opam-version.outputs.version }}-ocaml-4.14.2-frama-c-${{ matrix.frama-c-version }}-alt-ergo-2.6.3-v2
 
       # alt-ergo is named explicitly because it is an OPTIONAL dependency of
       # frama-c, not a hard one. This step used to say "alt-ergo + why3 pulled
@@ -352,6 +358,11 @@ jobs:
         with:
           ocaml-compiler: "4.14.2"
 
+      # Same reason as the full lane: key the restored root on its opam.
+      - name: Record opam version
+        id: opam-version
+        run: echo "version=$(opam --version)" >> "$GITHUB_OUTPUT"
+
       - name: Cache opam state (~/.opam + _opam)
         id: cache-opam
         uses: actions/cache@v6
@@ -359,7 +370,7 @@ jobs:
           path: |
             ~/.opam
             _opam
-          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-32.1-cppo-alt-ergo-2.6.3-v2
+          key: ${{ runner.os }}-opam-${{ steps.opam-version.outputs.version }}-ocaml-4.14.2-frama-c-32.1-cppo-alt-ergo-2.6.3-v2
 
       # alt-ergo for the same reason the full lane names it: it is an OPTIONAL
       # dependency of frama-c, so installing frama-c alone brings why3 and not
